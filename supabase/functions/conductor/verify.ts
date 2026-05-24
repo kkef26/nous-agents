@@ -1,18 +1,24 @@
 // supabase/functions/conductor/verify.ts
 // AGT.1.1.2 — Conductor v2 verify mode (6-step playbook).
+// AGT.1.1.4.1 — Calibration v2: 4-band thresholds, trigger-word override,
+//   pass_with_amendments → amendment_queue, tactical retry rewrite detection.
 //
 // Cold-read discipline (HARD RULE): never reads worker self-narrative.
 // Inputs reduced to {dispatch_id, clause_id, agent_id?}; everything else
 // (acceptance_criteria, diff content, prior runs) is derived from canonical
 // sources — nous.bible_clauses + GitHub Compare API + nous.conductor_log.
 //
-// Verdict mapping (AC#8):
-//   Sentinel score ≥ 75 → pass
-//   Sentinel score 60-74 → fail_tactical
-//   Sentinel score <  60 → fail_strategic
+// Verdict mapping (calibration v2):
+//   Sentinel score ≥ 85           → pass
+//   Sentinel score 75-84          → pass_with_amendments (followup_polish)
+//   Sentinel score 60-74          → fail_tactical
+//   Sentinel score <  60          → fail_strategic
+// Override (Step 5): score in [75,85) AND sentinel flagged missing steps
+//   in amendments_suggested or notes → force fail_tactical regardless of
+//   raw score. This catches the "5 of 6 steps shipped but scored 78" case
+//   that motivated AGT.1.1.4.1.
 // Any AC fail downgrades to at least fail_tactical regardless of score.
-// pass_with_amendments / hold_for_review used when Sentinel flags amendments
-// or when an external block (compile fail / fuse) requires Kosta review.
+// hold_for_review fires on compile_fail (build broken, Kosta gate).
 
 import {
   checkDedup,
@@ -23,6 +29,7 @@ import { compareCommits, getFileContent } from "../_common/github.ts";
 import { writeStep, finalizeStep } from "../_common/logging.ts";
 import { getSupabaseClient } from "../_common/db.ts";
 import { scoreWith5Axis } from "./sentinel.ts";
+import { createFuse } from "./fuse_manager.ts";
 import type {
   AuditTrail,
   ConductorLogRow,
@@ -34,10 +41,23 @@ const JSON_HEADERS = { "Content-Type": "application/json" };
 const GITHUB_OWNER = "kkef26";
 const DEDUP_WINDOW_SECONDS = 30;
 const HOURLY_CAP = 20;
-const PASS_THRESHOLD = 75;
-const TACTICAL_FLOOR = 60;
 
-// AC#8 verdict literals.
+// Calibration v2 thresholds (AGT.1.1.4.1)
+const CLEAN_PASS_THRESHOLD = 85;       // ≥85 ships clean
+const AMENDMENTS_THRESHOLD = 75;       // 75-84 ships with amendments
+const TACTICAL_FLOOR = 60;             // 60-74 fail_tactical
+// <60 fail_strategic
+
+// Tactical retry rewrite detection (AGT.1.1.4.1 Change 5)
+const REWRITE_DELETIONS_FLOOR = 50;
+const REWRITE_RATIO_CEILING = 1.5;
+
+// Sentinel-flag override regexes (AGT.1.1.4.1 Change 2)
+const MISSING_PATTERNS =
+  /(missing|incomplete|not yet|absent|skipped|deferred|stub(?:bed)?)/i;
+const STEP_REF_PATTERN = /(Step\s+\d|step\s+\d|AC\d{2}|AC\s+\d)/;
+
+// Verdict literals (calibration v2: pass_with_amendments is first-class)
 export type VerifyVerdict =
   | "pass"
   | "fail_tactical"
@@ -88,6 +108,7 @@ interface VerifyResponse {
   amendments_suggested: string[];
   run_id: string;
   conductor_log_id: string;
+  override_reason?: string | null;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -167,6 +188,26 @@ async function resolveRepo(project: string): Promise<{ owner: string; repo: stri
 }
 
 /**
+ * Count prior tactical-fail conductor_log rows for this clause. Used to
+ * derive attempt_count without taking a worker-side input. Attempt 1 is
+ * the first run (no priors); attempt 2+ is a tactical retry.
+ */
+async function countPriorTacticalAttempts(clause_id: string): Promise<number> {
+  // deno-lint-ignore no-explicit-any
+  const sb = getSupabaseClient() as any;
+  try {
+    const { count } = await sb
+      .from("conductor_log")
+      .select("run_id", { count: "exact", head: true })
+      .eq("clause_id", clause_id)
+      .eq("verdict", "fail_tactical");
+    return typeof count === "number" ? count : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Produce a single concatenated diff text from the GitHub compare response.
  * Each file's patch is prefaced with the filename so the cold-reader (and
  * Sentinel) can correlate hunks to files.
@@ -175,6 +216,21 @@ function flattenDiff(cmp: GitHubCompare): string {
   return cmp.files
     .map((f) => `### ${f.status} ${f.filename} (+${f.additions}/-${f.deletions})\n${f.patch ?? ""}`)
     .join("\n\n");
+}
+
+/**
+ * Sum total additions/deletions across a compare result. Used by the
+ * tactical-retry rewrite detector — large -deletions with small +additions
+ * looks like rewrite-from-scratch rather than an additive amendment.
+ */
+function totalChurn(cmp: GitHubCompare): { additions: number; deletions: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const f of cmp.files) {
+    additions += f.additions ?? 0;
+    deletions += f.deletions ?? 0;
+  }
+  return { additions, deletions };
 }
 
 /**
@@ -191,6 +247,7 @@ async function evaluateAC(
   repo: string,
 ): Promise<ACEvaluation> {
   const lower = ac.text.toLowerCase();
+  void lower;
 
   // "<path> exists on staging" — verify by hitting Contents API.
   const existsMatch = ac.text.match(/(\S+\.(?:ts|tsx|js|sql|md|json|yaml|yml))\s+exists\s+on\s+staging/i);
@@ -283,28 +340,138 @@ async function evaluatePillars(opts: {
   return { compile, ac, harmonic, pattern, score, sound };
 }
 
-// ─── Step 5: verdict resolution ──────────────────────────────────────────────
+// ─── Step 5: verdict resolution + override ───────────────────────────────────
+
+/**
+ * AGT.1.1.4.1 override: detect when Sentinel flagged missing spec steps in
+ * its own amendments/notes. A 78/100 with notes saying "5 of 6 steps
+ * complete, Step 1 missing" is the failure case this clause was born from.
+ *
+ * Returns the override_reason string if triggered, else null.
+ */
+function detectMissingStepOverride(opts: {
+  score: number;
+  amendments_suggested: string[];
+  sentinel_notes: string;
+}): string | null {
+  // Only override in the "ships with amendments" band; clean passes (≥85)
+  // are kept clean, tactical/strategic fails (<75) already loop.
+  if (opts.score < AMENDMENTS_THRESHOLD || opts.score >= CLEAN_PASS_THRESHOLD) {
+    return null;
+  }
+
+  // An amendment with BOTH a missing-word AND a step/AC reference is the
+  // signal that the model itself saw a gap.
+  const amendmentHasMissingStep = opts.amendments_suggested.some(
+    (a) => MISSING_PATTERNS.test(a) && STEP_REF_PATTERN.test(a),
+  );
+
+  // Alternatively, the model's own notes flag something missing — that's
+  // strong enough on its own to loop.
+  const notesFlagsMissing = MISSING_PATTERNS.test(opts.sentinel_notes);
+
+  if (amendmentHasMissingStep || notesFlagsMissing) {
+    return "sentinel_flagged_missing_steps_in_amendments";
+  }
+  return null;
+}
+
+interface VerdictResolution {
+  verdict: VerifyVerdict;
+  override_reason: string | null;
+}
 
 function resolveVerdict(opts: {
   score: number;
   ac_results: ACEvaluation[];
   pillars: PillarResults;
   amendments_suggested: string[];
-}): VerifyVerdict {
+  sentinel_notes: string;
+}): VerdictResolution {
   const hasACFail = opts.ac_results.some((r) => r.result === "fail");
   const compileFail = opts.pillars.compile === "fail";
 
   // Compile failure is a Kosta-review trigger (build is broken).
-  if (compileFail) return "hold_for_review";
+  if (compileFail) return { verdict: "hold_for_review", override_reason: null };
 
-  // AC#8 thresholds.
-  if (opts.score >= PASS_THRESHOLD) {
-    // Even on a passing score, AC fail downgrades.
-    if (hasACFail) return "fail_tactical";
-    return opts.amendments_suggested.length > 0 ? "pass_with_amendments" : "pass";
+  // AC fail always downgrades to at least tactical, regardless of score.
+  if (hasACFail && opts.score >= TACTICAL_FLOOR) {
+    return { verdict: "fail_tactical", override_reason: null };
   }
-  if (opts.score >= TACTICAL_FLOOR) return "fail_tactical";
-  return "fail_strategic";
+
+  // Step 5 override: substantive missing-step flag in the 75-84 band forces
+  // the loop. Conductor v2 should be strict — loop until clean.
+  const override = detectMissingStepOverride({
+    score: opts.score,
+    amendments_suggested: opts.amendments_suggested,
+    sentinel_notes: opts.sentinel_notes,
+  });
+  if (override) {
+    return { verdict: "fail_tactical", override_reason: override };
+  }
+
+  // Calibration v2 4-band thresholds (no override path).
+  if (opts.score >= CLEAN_PASS_THRESHOLD) {
+    // ≥85: if amendments suggested, still spawn followup_polish but ship.
+    return {
+      verdict: opts.amendments_suggested.length > 0 ? "pass_with_amendments" : "pass",
+      override_reason: null,
+    };
+  }
+  if (opts.score >= AMENDMENTS_THRESHOLD) {
+    // 75-84 without missing-step override: ships with amendments by definition.
+    return { verdict: "pass_with_amendments", override_reason: null };
+  }
+  if (opts.score >= TACTICAL_FLOOR) {
+    return { verdict: "fail_tactical", override_reason: null };
+  }
+  return { verdict: "fail_strategic", override_reason: null };
+}
+
+// ─── Amendment queue (Step 6 — pass_with_amendments path) ────────────────────
+
+/**
+ * Insert amendments into nous.amendment_queue with kind='followup_polish'.
+ * One row per amendment so each can be picked up independently. Best-effort:
+ * a failure here logs but does NOT block the verdict — the conductor_log
+ * row (with amendment_hint column) is still the canonical record.
+ */
+async function enqueueFollowupAmendments(opts: {
+  clause_id: string;
+  project: string;
+  feature_id: string | null;
+  amendments: string[];
+  run_id: string;
+  parent_run_id: string | null;
+  session_id: string | null;
+}): Promise<{ enqueued: number; errors: number }> {
+  if (opts.amendments.length === 0) return { enqueued: 0, errors: 0 };
+
+  // deno-lint-ignore no-explicit-any
+  const sb = getSupabaseClient() as any;
+  const rows = opts.amendments.map((content) => ({
+    clause_id: opts.clause_id,
+    project: opts.project,
+    feature_id: opts.feature_id,
+    kind: "followup_polish",
+    content,
+    source_run_id: opts.run_id,
+    parent_run_id: opts.parent_run_id,
+    session_id: opts.session_id,
+    status: "pending",
+  }));
+
+  try {
+    const { error } = await sb.from("amendment_queue").insert(rows);
+    if (error) {
+      console.error(`[verify] amendment_queue insert failed: ${error.message}`);
+      return { enqueued: 0, errors: rows.length };
+    }
+    return { enqueued: rows.length, errors: 0 };
+  } catch (err) {
+    console.error(`[verify] amendment_queue insert threw: ${(err as Error).message}`);
+    return { enqueued: 0, errors: rows.length };
+  }
 }
 
 // ─── handleVerify ────────────────────────────────────────────────────────────
@@ -363,6 +530,7 @@ export async function handleVerify(req: Request): Promise<Response> {
 
   const compare = await compareCommits(owner, repo, "main", "staging");
   const diff_text = flattenDiff(compare);
+  const churn = totalChurn(compare);
 
   const ac_results: ACEvaluation[] = [];
   for (const ac of acs) {
@@ -371,6 +539,44 @@ export async function handleVerify(req: Request): Promise<Response> {
 
   // ── Step 3 — 6-pillar quality checks ─────────────────────────────────────
   const pillars = await evaluatePillars({ ac_results, diff_text, owner, repo });
+
+  // Tactical-retry rewrite detection (AGT.1.1.4.1 Change 5): count prior
+  // fail_tactical runs for this clause; if this looks like a from-scratch
+  // rewrite rather than an additive amendment, fire a compile_fail fuse
+  // with the rewrite-from-scratch marker. Best-effort — failure to fire
+  // the fuse must not block verification, so we wrap in try/catch.
+  const priorTacticalCount = await countPriorTacticalAttempts(parsed.clause_id);
+  const attempt_count = priorTacticalCount + 1;
+  const ratio = churn.deletions > 0 ? churn.additions / churn.deletions : Infinity;
+  if (
+    attempt_count > 1 &&
+    churn.deletions > REWRITE_DELETIONS_FLOOR &&
+    ratio < REWRITE_RATIO_CEILING
+  ) {
+    try {
+      await createFuse({
+        kind: "compile_fail",
+        project: clause.project,
+        clause_id: parsed.clause_id,
+        feature_id: clause.feature_id ?? undefined,
+        detail: "tactical_retry_appeared_to_rewrite_from_scratch",
+        severity: "advisory",
+        triggered_by_agent_id: audit.triggered_by_agent_id,
+        session_id: audit.session_id,
+        parent_run_id: audit.parent_run_id ?? undefined,
+        proposed_resolution:
+          `attempt ${attempt_count}: additions=${churn.additions}, deletions=${churn.deletions}, ` +
+          `ratio=${ratio.toFixed(2)} (<${REWRITE_RATIO_CEILING}). Worker should fetch prior SHA ` +
+          `and amend additively, not rewrite from scratch.`,
+      });
+      console.warn(
+        `[verify] tactical_retry_appeared_to_rewrite_from_scratch fuse fired for ${parsed.clause_id} ` +
+          `(attempt=${attempt_count}, +${churn.additions}/-${churn.deletions})`,
+      );
+    } catch (err) {
+      console.error(`[verify] rewrite-fuse create failed: ${(err as Error).message}`);
+    }
+  }
 
   // Open the conductor_log row early so step 6 can finalize it.
   const initialRow: ConductorLogRow = {
@@ -395,23 +601,51 @@ export async function handleVerify(req: Request): Promise<Response> {
   const run_id = await writeStep("conductor_log", initialRow);
 
   // ── Step 4 — Sentinel scoring (claude-haiku-4-5, 5-axis rubric) ──────────
+  // No client-side truncation — sentinel.ts chunks on function boundaries
+  // for inputs >100KB. Watch for chunked=true so we can log the fallback.
   const sentinel = await scoreWith5Axis({
     clause_id: parsed.clause_id,
     acceptance_criteria: acs,
     diff_content: diff_text,
     pillar_results: pillars,
   });
-  pillars.score = sentinel.score >= PASS_THRESHOLD ? "pass" : sentinel.score >= TACTICAL_FLOOR ? "warn" : "fail";
+  pillars.score =
+    sentinel.score >= AMENDMENTS_THRESHOLD ? "pass"
+    : sentinel.score >= TACTICAL_FLOOR ? "warn"
+    : "fail";
 
-  // ── Step 5 — decide verdict ──────────────────────────────────────────────
-  const verdict = resolveVerdict({
+  if (sentinel.chunked) {
+    console.warn(
+      `[verify] sentinel input was chunked into ${sentinel.chunk_count} pieces for ${parsed.clause_id} ` +
+        `(weighted-average scoring); full context preserved.`,
+    );
+  }
+
+  // ── Step 5 — decide verdict (with override) ──────────────────────────────
+  const verdictResult = resolveVerdict({
     score: sentinel.score,
     ac_results,
     pillars,
     amendments_suggested: sentinel.amendments_suggested,
+    sentinel_notes: sentinel.notes,
   });
+  const verdict = verdictResult.verdict;
+  const override_reason = verdictResult.override_reason;
 
-  // ── Step 6 — finalize conductor_log row with verdict + audit trail ──────
+  // ── Step 6 — finalize conductor_log row + (if pass_with_amendments) enqueue ──
+  let enqueueResult = { enqueued: 0, errors: 0 };
+  if (verdict === "pass_with_amendments" && sentinel.amendments_suggested.length > 0) {
+    enqueueResult = await enqueueFollowupAmendments({
+      clause_id: parsed.clause_id,
+      project: clause.project,
+      feature_id: clause.feature_id,
+      amendments: sentinel.amendments_suggested,
+      run_id,
+      parent_run_id: audit.parent_run_id,
+      session_id: audit.session_id,
+    });
+  }
+
   await finalizeStep("conductor_log", run_id, {
     step_output: {
       verdict,
@@ -419,6 +653,13 @@ export async function handleVerify(req: Request): Promise<Response> {
       pillar_results: pillars,
       amendments_suggested: sentinel.amendments_suggested,
       sentinel_notes: sentinel.notes,
+      override_reason,
+      sentinel_chunked: sentinel.chunked ?? false,
+      sentinel_chunk_count: sentinel.chunk_count ?? 1,
+      attempt_count,
+      churn,
+      followup_enqueued: enqueueResult.enqueued,
+      followup_enqueue_errors: enqueueResult.errors,
     },
     duration_ms: Date.now() - startedAt,
     error: null,
@@ -428,18 +669,22 @@ export async function handleVerify(req: Request): Promise<Response> {
   });
 
   // Also patch the verdict + sentinel_score + sentinel_axes columns on the
-  // same row so /log readers don't need to dig into step_output.
+  // same row so /log readers don't need to dig into step_output. The
+  // override_reason field is best-effort: older deployments without the
+  // column continue reading fine (PATCH silently no-ops the unknown field).
   const sb = getSupabaseClient();
+  const patch: Record<string, unknown> = {
+    verdict,
+    sentinel_score: sentinel.score,
+    sentinel_axes: sentinel.per_axis,
+    amendment_hint: sentinel.amendments_suggested.length > 0
+      ? { suggestions: sentinel.amendments_suggested }
+      : null,
+  };
+  if (override_reason) patch.override_reason = override_reason;
   const { error: patchErr } = await sb
     .from("conductor_log")
-    .update({
-      verdict,
-      sentinel_score: sentinel.score,
-      sentinel_axes: sentinel.per_axis,
-      amendment_hint: sentinel.amendments_suggested.length > 0
-        ? { suggestions: sentinel.amendments_suggested }
-        : null,
-    })
+    .update(patch)
     .eq("run_id", run_id);
   if (patchErr) {
     // Log row exists; column patch failed — surface but don't bury the verdict.
@@ -455,6 +700,7 @@ export async function handleVerify(req: Request): Promise<Response> {
     amendments_suggested: sentinel.amendments_suggested,
     run_id,
     conductor_log_id: run_id,
+    override_reason,
   };
   return jsonResponse(response, 200);
 }
