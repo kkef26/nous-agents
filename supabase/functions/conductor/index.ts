@@ -1,14 +1,13 @@
 // supabase/functions/conductor/index.ts
-// Conductor v2 — router skeleton (AGT.1.1.1)
+// Conductor v2 — router.
 //
 // Three routes:
-//   POST /run    — delegates to verify.ts or merge.ts (stub until AGT.1.1.2/AGT.1.1.3)
+//   POST /run    — delegates to verify.ts (stub) or merge.ts (AGT.1.1.3)
 //   GET  /status — liveness + version (AGT.1.1.7)
 //   GET  /log    — conductor_log reader (AGT.1.1.7)
-//
-// Real fuse_manager / delegate wiring lands in AGT.1.1.6 + AGT.1.1.2.
 
 import { handleLog, handleStatus } from "./status.ts";
+import { handleMerge } from "./merge.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -16,17 +15,10 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
 
-// Stub delegates — replaced by real imports in later clauses.
+// Verify mode lands in AGT.1.1.2 — still stubbed here.
 async function runVerifyStub(payload: Record<string, unknown>): Promise<Response> {
   return jsonResponse(
     { stub: true, message: "verify.ts not yet implemented", route: "/run", mode: payload.mode },
-    501,
-  );
-}
-
-async function runMergeStub(payload: Record<string, unknown>): Promise<Response> {
-  return jsonResponse(
-    { stub: true, message: "merge.ts not yet implemented", route: "/run", mode: payload.mode },
     501,
   );
 }
@@ -35,6 +27,8 @@ async function handleRun(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return jsonResponse({ error: "method_not_allowed", allow: "POST" }, 405);
   }
+  // Tee the body once so we can read `mode` here and still hand a fresh
+  // Request to the delegate (handleMerge calls req.json() itself).
   let body: Record<string, unknown>;
   try {
     body = await req.json();
@@ -45,14 +39,20 @@ async function handleRun(req: Request): Promise<Response> {
   if (mode !== "verify" && mode !== "merge") {
     return jsonResponse({ error: "mode must be verify or merge" }, 400);
   }
-  return mode === "verify" ? await runVerifyStub(body) : await runMergeStub(body);
+  if (mode === "verify") return await runVerifyStub(body);
+
+  // Rebuild request with the already-parsed body for handleMerge.
+  const proxied = new Request(req.url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return await handleMerge(proxied);
 }
 
 async function router(req: Request): Promise<Response> {
   try {
     const { pathname } = new URL(req.url);
-    // Strip the edge-function base prefix `/conductor` if present (Supabase
-    // edge function routing always mounts under the function name).
     const path = pathname.replace(/^\/conductor/, "") || "/";
 
     if (path === "/run") return await handleRun(req);
