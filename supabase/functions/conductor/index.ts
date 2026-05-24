@@ -3,12 +3,12 @@
 //
 // Three routes:
 //   POST /run    — delegates to verify.ts or merge.ts (stub until AGT.1.1.2/AGT.1.1.3)
-//   GET  /status — liveness + version
-//   GET  /log    — conductor_log reader (stub until later clause)
+//   GET  /status — liveness + version (AGT.1.1.7)
+//   GET  /log    — conductor_log reader (AGT.1.1.7)
 //
 // Real fuse_manager / delegate wiring lands in AGT.1.1.6 + AGT.1.1.2.
 
-const VERSION = "conductor-v0.1.0";
+import { handleLog, handleStatus } from "./status.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -46,24 +46,6 @@ async function handleRun(req: Request): Promise<Response> {
     return jsonResponse({ error: "mode must be verify or merge" }, 400);
   }
   return mode === "verify" ? await runVerifyStub(body) : await runMergeStub(body);
-}
-
-async function handleStatus(req: Request): Promise<Response> {
-  if (req.method !== "GET") {
-    return jsonResponse({ error: "method_not_allowed", allow: "GET" }, 405);
-  }
-  // status.ts not yet built — reads no DB at this stage.
-  return jsonResponse({ alive: true, version: VERSION, last_run_at: null }, 200);
-}
-
-async function handleLog(req: Request): Promise<Response> {
-  if (req.method !== "GET") {
-    return jsonResponse({ error: "method_not_allowed", allow: "GET" }, 405);
-  }
-  return jsonResponse(
-    { logs: [], message: "conductor_log handler not yet implemented" },
-    501,
-  );
 }
 
 async function router(req: Request): Promise<Response> {
