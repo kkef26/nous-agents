@@ -76,6 +76,7 @@ interface VerifyRequest {
   session_id?: string;
   org_id?: string | null;
   parent_run_id?: string | null;
+  fuse_id?: string | null;
 }
 
 interface VerifyResponse {
@@ -109,6 +110,7 @@ function parseBody(body: unknown): VerifyRequest | { error: string } {
     session_id: typeof b.session_id === "string" ? b.session_id : undefined,
     org_id: typeof b.org_id === "string" ? b.org_id : null,
     parent_run_id: typeof b.parent_run_id === "string" ? b.parent_run_id : null,
+    fuse_id: typeof b.fuse_id === "string" ? b.fuse_id : null,
   };
 }
 
@@ -323,12 +325,16 @@ export async function handleVerify(req: Request): Promise<Response> {
   if ("error" in parsed) return jsonResponse(parsed, 400);
 
   const startedAt = Date.now();
+  // AC#9 audit trail: org_id, triggered_by_agent_id, session_id, parent_run_id, fuse_id.
+  // AuditTrail (shared types) covers the first four; fuse_id is a ConductorLogRow
+  // column tracked separately so non-conductor consumers don't need to know about it.
   const audit: AuditTrail = {
     org_id: parsed.org_id ?? null,
     triggered_by_agent_id: parsed.agent_id ?? "conductor",
     session_id: parsed.session_id ?? `conductor-${Date.now()}`,
     parent_run_id: parsed.parent_run_id ?? null,
   };
+  const fuse_id: string | null = parsed.fuse_id ?? null;
 
   // ── Step 1 — input verification + loop guard ─────────────────────────────
   const input_hash = await hashInput({
@@ -384,6 +390,7 @@ export async function handleVerify(req: Request): Promise<Response> {
     triggered_by_agent_id: audit.triggered_by_agent_id,
     session_id: audit.session_id,
     parent_run_id: audit.parent_run_id,
+    fuse_id,
   };
   const run_id = await writeStep("conductor_log", initialRow);
 

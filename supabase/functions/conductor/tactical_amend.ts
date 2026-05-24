@@ -118,24 +118,97 @@ function readEnv(name: string): string {
   return v;
 }
 
+/** Max attempts for transient DB / network retry loops. */
+const DB_RETRY_MAX_ATTEMPTS = 3;
+/** Base delay for exponential backoff in ms (100, 200, 400). */
+const DB_RETRY_BASE_DELAY_MS = 100;
+
+/**
+ * Run `fn` with exponential backoff. Used to insulate the conductor from
+ * transient Supabase / network blips (dropped pool connections, brief 5xx).
+ * Logs each retry; on final failure, rethrows the original error so callers
+ * see the underlying message.
+ */
+async function withRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  maxAttempts: number = DB_RETRY_MAX_ATTEMPTS,
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt === maxAttempts) break;
+      const delayMs = DB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `tactical_amend.${label}: attempt ${attempt}/${maxAttempts} failed, ` +
+          `retrying in ${delayMs}ms — ${msg}`,
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  if (lastError instanceof Error) throw lastError;
+  throw new Error(
+    `tactical_amend.${label}: failed after ${maxAttempts} attempts`,
+  );
+}
+
 async function lookupProject(parent_dispatch_id: string): Promise<{
   project: string;
   feature_id: string | null;
 }> {
-  const { data, error } = await db()
-    .from("dispatch_queue")
-    .select("project, feature_id")
-    .eq("id", parent_dispatch_id)
-    .maybeSingle();
-  if (error) {
-    throw new Error(
-      `tactical_amend.lookupProject: select failed — ${error.message}`,
-    );
+  return await withRetry("lookupProject", async () => {
+    const { data, error } = await db()
+      .from("dispatch_queue")
+      .select("project, feature_id")
+      .eq("id", parent_dispatch_id)
+      .maybeSingle();
+    if (error) {
+      throw new Error(
+        `tactical_amend.lookupProject: select failed — ${error.message}`,
+      );
+    }
+    return {
+      project: data?.project ?? "unknown",
+      feature_id: data?.feature_id ?? null,
+    };
+  });
+}
+
+/**
+ * Typed guard for /dispatch/tree response. Returns the extracted dispatch_id
+ * if the payload matches one of the three accepted shapes, otherwise null.
+ *
+ * Accepted shapes:
+ *   { dispatch_id: string }           // single-clause shortcut
+ *   { dispatch_ids: string[] }        // multi-clause
+ *   { tasks: [{ id: string, ... }] }  // legacy/task envelope
+ *
+ * A `null` return is the caller's signal to fire a `compile_fail` fuse and
+ * abort the retry — silently dropping new_dispatch_id would let the verify
+ * loop think a retry succeeded when nothing actually ran.
+ */
+function parseDispatchResponse(json: unknown): string | null {
+  if (!json || typeof json !== "object") return null;
+  const obj = json as Record<string, unknown>;
+
+  if (typeof obj.dispatch_id === "string" && obj.dispatch_id.length > 0) {
+    return obj.dispatch_id;
   }
-  return {
-    project: data?.project ?? "unknown",
-    feature_id: data?.feature_id ?? null,
-  };
+  if (Array.isArray(obj.dispatch_ids)) {
+    const first = obj.dispatch_ids[0];
+    if (typeof first === "string" && first.length > 0) return first;
+  }
+  if (Array.isArray(obj.tasks)) {
+    const first = obj.tasks[0] as { id?: unknown } | undefined;
+    if (first && typeof first.id === "string" && first.id.length > 0) {
+      return first.id;
+    }
+  }
+  return null;
 }
 
 /**
@@ -222,19 +295,21 @@ async function escalateToScoper(
     owner: "scoper",
   };
 
-  const { data, error } = await db()
-    .from("amendment_queue")
-    .insert(insertRow)
-    .select("id")
-    .single();
+  const inserted = await withRetry("escalateToScoper.insert", async () => {
+    const { data, error } = await db()
+      .from("amendment_queue")
+      .insert(insertRow)
+      .select("id")
+      .single();
+    if (error) {
+      throw new Error(
+        `tactical_amend.escalateToScoper: insert failed — ${error.message}`,
+      );
+    }
+    return data;
+  });
 
-  if (error) {
-    throw new Error(
-      `tactical_amend.escalateToScoper: insert failed — ${error.message}`,
-    );
-  }
-
-  const amendment_queue_id = data.id;
+  const amendment_queue_id = inserted.id;
 
   await createFuse({
     kind: "tactical_retry_exhausted",
@@ -268,6 +343,8 @@ async function escalateToScoper(
 
 async function dispatchRetry(
   opts: TacticalAmendOpts,
+  project: string,
+  featureId: string | null,
   hint: ReturnType<typeof buildHintPayload>,
 ): Promise<TacticalAmendResult> {
   const nousUrl = readEnv("NOUS_URL").replace(/\/$/, "");
@@ -301,19 +378,49 @@ async function dispatchRetry(
     );
   }
 
-  const json = await res.json().catch(() => ({} as Record<string, unknown>));
+  const rawText = await res.text().catch(() => "");
+  let json: unknown = null;
+  try {
+    json = rawText.length > 0 ? JSON.parse(rawText) : null;
+  } catch (_e) {
+    json = null;
+  }
 
-  // Accept either { dispatch_id } (single-clause shortcut) or
-  // { dispatch_ids: [...] } / { tasks: [{id}] } shapes.
-  let new_dispatch_id: string | undefined;
-  if (typeof (json as { dispatch_id?: unknown }).dispatch_id === "string") {
-    new_dispatch_id = (json as { dispatch_id: string }).dispatch_id;
-  } else if (Array.isArray((json as { dispatch_ids?: unknown }).dispatch_ids)) {
-    const arr = (json as { dispatch_ids: unknown[] }).dispatch_ids;
-    if (typeof arr[0] === "string") new_dispatch_id = arr[0] as string;
-  } else if (Array.isArray((json as { tasks?: unknown }).tasks)) {
-    const arr = (json as { tasks: Array<{ id?: string }> }).tasks;
-    if (arr[0] && typeof arr[0].id === "string") new_dispatch_id = arr[0].id;
+  const new_dispatch_id = parseDispatchResponse(json);
+
+  if (new_dispatch_id === null) {
+    // Response shape is none of { dispatch_id }, { dispatch_ids[] }, { tasks[] }.
+    // Fire a compile_fail fuse so the conductor surface flags it loudly instead
+    // of silently returning retry_dispatched:true with no usable dispatch_id.
+    const snippet = rawText.length > 0
+      ? rawText.slice(0, 500)
+      : "<empty body>";
+    console.error(
+      `tactical_amend.dispatchRetry: dispatch_response_malformed — ` +
+        `status=${res.status} body=${snippet}`,
+    );
+    await createFuse({
+      kind: "compile_fail",
+      project,
+      detail:
+        `dispatch_response_malformed: POST ${nousUrl}/dispatch/tree returned ` +
+        `HTTP ${res.status} with a payload that matched none of the accepted ` +
+        `shapes ({dispatch_id} | {dispatch_ids[]} | {tasks[{id}]}). ` +
+        `Body snippet: ${snippet}`,
+      severity: "critical",
+      clause_id: opts.clause_id,
+      feature_id: featureId ?? undefined,
+      triggered_by_agent_id: CREATED_BY,
+      parent_run_id: opts.parent_dispatch_id,
+      proposed_resolution:
+        "Inspect nous-edge /dispatch/tree response contract and align " +
+        "either the producer or parseDispatchResponse() guard.",
+    });
+    throw new Error(
+      `tactical_amend.dispatchRetry: /dispatch/tree returned a payload ` +
+        `that did not contain a usable dispatch_id (shape mismatch). ` +
+        `Fired compile_fail fuse. Body snippet: ${snippet}`,
+    );
   }
 
   return {
@@ -352,5 +459,5 @@ export async function tacticalAmend(
     return await escalateToScoper(opts, project, feature_id, hint);
   }
 
-  return await dispatchRetry(opts, hint);
+  return await dispatchRetry(opts, project, feature_id, hint);
 }
