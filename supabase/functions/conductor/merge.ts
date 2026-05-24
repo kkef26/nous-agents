@@ -388,20 +388,33 @@ export async function handleMerge(req: Request): Promise<Response> {
     // ─── Step 3: read staging diff ────────────────────────────────────────
     const compare = await compareCommits(owner, repoName, "main", "staging");
 
-    if (compare.total_commits === 0) {
+    // Sentinel amendment (AC04): explicit empty-diff guard. GitHub's compare
+    // endpoint may report ahead_by=0 while still echoing a base_commit;
+    // proceeding to step 5 in that state would hit a 409 from /merges and
+    // pollute conductor_log with a misleading failure. Short-circuit cleanly.
+    if (compare.ahead_by === 0 || compare.total_commits === 0) {
       await writeConductorStep({
         mode: "merge",
         project,
         step: 3,
         step_name: "diff_empty",
-        step_output: { status: compare.status, ahead_by: compare.ahead_by },
+        step_output: {
+          status: compare.status,
+          ahead_by: compare.ahead_by,
+          total_commits: compare.total_commits,
+        },
         org_id: audit.org_id,
         triggered_by_agent_id: audit.triggered_by_agent_id,
         session_id: audit.session_id,
         parent_run_id: audit.parent_run_id,
         duration_ms: Date.now() - startedAt,
       });
-      return json({ merged: false, reason: "nothing_to_merge", commits_merged: 0 });
+      return json({
+        merged: false,
+        reason: "no_changes_to_merge",
+        commits_merged: 0,
+        ahead_by: compare.ahead_by,
+      });
     }
 
     const clauseIds = extractClauseIds(compare.commits.map((c) => c.commit.message));
@@ -550,17 +563,50 @@ export async function handleMerge(req: Request): Promise<Response> {
     // ─── Step 6: wait for Vercel build ────────────────────────────────────
     let vercelState: string | null = null;
     let vercelUrl: string | null = null;
+    let vercelPollTimedOut = false;
     if (isVercelTarget(canonicalVercelProject, deployTarget)) {
       const projectKey = canonicalVercelProject || project;
+      const vercelPollStartedAt = Date.now();
       const polled = await pollVercelDeployment(projectKey, mergeSha);
+      const vercelPollElapsedMs = Date.now() - vercelPollStartedAt;
       vercelState = polled.state;
       vercelUrl = polled.url;
+      vercelPollTimedOut = polled.state === "TIMEOUT";
+
+      // Sentinel amendment (AC06-07): explicit timeout escalation. The merge
+      // commit already exists on main — we do NOT roll it back or flip the
+      // merge result. We only surface a fuse so the operator notices Vercel
+      // never reported ready inside the poll window.
+      if (vercelPollTimedOut) {
+        await createFuse({
+          kind: "production_verify_fail",
+          project,
+          detail: `vercel_poll_timeout: project=${projectKey} sha=${mergeSha.slice(0, 7)} elapsed_ms=${vercelPollElapsedMs} budget_ms=${VERCEL_POLL_MAX_MS}`,
+          severity: "critical",
+          triggered_by_agent_id: audit.triggered_by_agent_id,
+          session_id: audit.session_id,
+          parent_run_id: audit.parent_run_id,
+          proposed_resolution:
+            "Check Vercel dashboard for build status; if still building extend window, else investigate failed/canceled deployment.",
+        });
+      }
+
       await writeConductorStep({
         mode: "merge",
         project,
         step: 6,
-        step_name: polled.ready ? "vercel_ready" : "vercel_not_ready",
-        step_output: { state: polled.state, url: polled.url },
+        step_name: polled.ready
+          ? "vercel_ready"
+          : vercelPollTimedOut
+            ? "vercel_poll_timeout"
+            : "vercel_not_ready",
+        step_output: {
+          state: polled.state,
+          url: polled.url,
+          elapsed_ms: vercelPollElapsedMs,
+          budget_ms: VERCEL_POLL_MAX_MS,
+          timed_out: vercelPollTimedOut,
+        },
         org_id: audit.org_id,
         triggered_by_agent_id: audit.triggered_by_agent_id,
         session_id: audit.session_id,
@@ -640,6 +686,7 @@ export async function handleMerge(req: Request): Promise<Response> {
         production_url: deployTarget,
         vercel_state: vercelState,
         vercel_url: vercelUrl,
+        vercel_poll_timed_out: vercelPollTimedOut,
       },
       org_id: audit.org_id,
       triggered_by_agent_id: audit.triggered_by_agent_id,
@@ -656,6 +703,7 @@ export async function handleMerge(req: Request): Promise<Response> {
       clause_ids: clauseIds,
       production_verified: productionVerified,
       production_url: deployTarget,
+      vercel_poll_timed_out: vercelPollTimedOut,
     });
   } catch (err) {
     // Lock release happens in finally; here we only log + respond.
