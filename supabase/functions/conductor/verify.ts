@@ -139,9 +139,9 @@ function parseBody(body: unknown): VerifyRequest | { error: string } {
 
 interface BibleClauseRow {
   id: string;
-  project: string;
   feature_id: string | null;
   acceptance_criteria: ACRow[] | null;
+  project: string; // resolved from dispatch_queue, not bible_clauses
 }
 
 /**
@@ -149,7 +149,7 @@ interface BibleClauseRow {
  * dispatch_queue.result / .prompt — those are worker self-narrative and
  * forbidden inputs to the verify pipeline.
  */
-async function fetchClause(clause_id: string): Promise<BibleClauseRow> {
+async function fetchClause(clause_id: string, dispatch_id: string): Promise<BibleClauseRow> {
   // bible_clauses lives in nous.* but isn't declared in NousDatabase; widen
   // the client at this boundary so the query type-checks without polluting
   // the shared types module.
@@ -157,12 +157,33 @@ async function fetchClause(clause_id: string): Promise<BibleClauseRow> {
   const sb = getSupabaseClient() as any;
   const { data, error } = await sb
     .from("bible_clauses")
-    .select("id, project, feature_id, acceptance_criteria")
+    .select("id, feature_id, acceptance_criteria")
     .eq("id", clause_id)
     .maybeSingle();
   if (error) throw new Error(`fetchClause(${clause_id}): ${error.message}`);
   if (!data) throw new Error(`fetchClause(${clause_id}): not found`);
-  return data as BibleClauseRow;
+
+  // Resolve project from dispatch_queue (bible_clauses has no project column;
+  // project is stored on dispatch_queue rows and nous.projects via clause_prefix).
+  const { data: dq } = await sb
+    .from("dispatch_queue")
+    .select("project")
+    .eq("id", dispatch_id)
+    .maybeSingle();
+  const project = dq?.project ?? null;
+  if (!project) {
+    // Fallback: resolve via prefix → nous.projects.clause_prefix
+    const prefix = clause_id.split(".")[0];
+    const { data: proj } = await sb
+      .from("projects")
+      .select("tag")
+      .eq("clause_prefix", prefix)
+      .limit(1)
+      .maybeSingle();
+    if (!proj?.tag) throw new Error(`fetchClause(${clause_id}): cannot resolve project from dispatch_queue or prefix`);
+    return { ...data, project: proj.tag } as BibleClauseRow;
+  }
+  return { ...data, project } as BibleClauseRow;
 }
 
 /**
@@ -524,7 +545,7 @@ export async function handleVerify(req: Request): Promise<Response> {
   }
 
   // ── Step 2 — cold-read AC re-verification ────────────────────────────────
-  const clause = await fetchClause(parsed.clause_id);
+  const clause = await fetchClause(parsed.clause_id, parsed.dispatch_id);
   const acs: ACRow[] = Array.isArray(clause.acceptance_criteria) ? clause.acceptance_criteria : [];
   const { owner, repo } = await resolveRepo(clause.project);
 
