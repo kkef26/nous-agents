@@ -139,9 +139,9 @@ function parseBody(body: unknown): VerifyRequest | { error: string } {
 
 interface BibleClauseRow {
   id: string;
-  project: string;
   feature_id: string | null;
   acceptance_criteria: ACRow[] | null;
+  project: string; // resolved from dispatch_queue, not bible_clauses
 }
 
 /**
@@ -149,7 +149,7 @@ interface BibleClauseRow {
  * dispatch_queue.result / .prompt — those are worker self-narrative and
  * forbidden inputs to the verify pipeline.
  */
-async function fetchClause(clause_id: string): Promise<BibleClauseRow> {
+async function fetchClause(clause_id: string, dispatch_id: string): Promise<BibleClauseRow> {
   // bible_clauses lives in nous.* but isn't declared in NousDatabase; widen
   // the client at this boundary so the query type-checks without polluting
   // the shared types module.
@@ -157,12 +157,33 @@ async function fetchClause(clause_id: string): Promise<BibleClauseRow> {
   const sb = getSupabaseClient() as any;
   const { data, error } = await sb
     .from("bible_clauses")
-    .select("id, project, feature_id, acceptance_criteria")
+    .select("id, feature_id, acceptance_criteria")
     .eq("id", clause_id)
     .maybeSingle();
   if (error) throw new Error(`fetchClause(${clause_id}): ${error.message}`);
   if (!data) throw new Error(`fetchClause(${clause_id}): not found`);
-  return data as BibleClauseRow;
+
+  // Resolve project from dispatch_queue (bible_clauses has no project column;
+  // project is stored on dispatch_queue rows and nous.projects via clause_prefix).
+  const { data: dq } = await sb
+    .from("dispatch_queue")
+    .select("project")
+    .eq("id", dispatch_id)
+    .maybeSingle();
+  const project = dq?.project ?? null;
+  if (!project) {
+    // Fallback: resolve via prefix → nous.projects.clause_prefix
+    const prefix = clause_id.split(".")[0];
+    const { data: proj } = await sb
+      .from("projects")
+      .select("tag")
+      .eq("clause_prefix", prefix)
+      .limit(1)
+      .maybeSingle();
+    if (!proj?.tag) throw new Error(`fetchClause(${clause_id}): cannot resolve project from dispatch_queue or prefix`);
+    return { ...data, project: proj.tag } as BibleClauseRow;
+  }
+  return { ...data, project } as BibleClauseRow;
 }
 
 /**
@@ -246,6 +267,9 @@ async function evaluateAC(
   owner: string,
   repo: string,
 ): Promise<ACEvaluation> {
+  if (!ac.text) {
+    return { id: ac.id || "unknown", text: "(missing)", result: "warn" as PillarResult, detail: "AC text undefined — skipped" };
+  }
   const lower = ac.text.toLowerCase();
   void lower;
 
@@ -474,6 +498,44 @@ async function enqueueFollowupAmendments(opts: {
   }
 }
 
+// ─── Status stamping (AGT.2.2 Part B — carwash position handoff) ───────────
+
+/**
+ * Update nous.bible_clauses.status based on the resolved verdict so the
+ * two-phase status model (AGT.2.1) reflects the conductor's decision.
+ *
+ *   pass / pass_with_amendments → 'verified'   (ready for merge.ts to stamp 'shipped')
+ *   fail_tactical / fail_strategic → 'build_failed' (sweeper picks up for amend/escalate)
+ *   hold_for_review → no change (compile broken, Kosta gate)
+ *
+ * Best-effort: a write failure logs but does not change the verdict — the
+ * conductor_log row is still the canonical record of what happened.
+ */
+async function stampClauseStatusFromVerdict(
+  clause_id: string,
+  verdict: VerifyVerdict,
+): Promise<void> {
+  let newStatus: string | null = null;
+  if (verdict === "pass" || verdict === "pass_with_amendments") {
+    newStatus = "verified";
+  } else if (verdict === "fail_tactical" || verdict === "fail_strategic") {
+    newStatus = "build_failed";
+  }
+  if (!newStatus) return;
+
+  // deno-lint-ignore no-explicit-any
+  const sb = getSupabaseClient() as any;
+  const { error } = await sb
+    .from("bible_clauses")
+    .update({ status: newStatus, updated_at: new Date().toISOString() })
+    .eq("id", clause_id);
+  if (error) {
+    console.error(
+      `[verify] stampClauseStatusFromVerdict(${clause_id} → ${newStatus}) failed: ${error.message}`,
+    );
+  }
+}
+
 // ─── handleVerify ────────────────────────────────────────────────────────────
 
 export async function handleVerify(req: Request): Promise<Response> {
@@ -524,7 +586,7 @@ export async function handleVerify(req: Request): Promise<Response> {
   }
 
   // ── Step 2 — cold-read AC re-verification ────────────────────────────────
-  const clause = await fetchClause(parsed.clause_id);
+  const clause = await fetchClause(parsed.clause_id, parsed.dispatch_id);
   const acs: ACRow[] = Array.isArray(clause.acceptance_criteria) ? clause.acceptance_criteria : [];
   const { owner, repo } = await resolveRepo(clause.project);
 
@@ -632,7 +694,12 @@ export async function handleVerify(req: Request): Promise<Response> {
   const verdict = verdictResult.verdict;
   const override_reason = verdictResult.override_reason;
 
-  // ── Step 6 — finalize conductor_log row + (if pass_with_amendments) enqueue ──
+  // ── Step 6 — stamp bible_clauses.status from verdict (AGT.2.2 Part B) ────
+  // Update the clause to its new carwash position before finalizing the log
+  // so the user-visible status reflects the decision even if log write fails.
+  await stampClauseStatusFromVerdict(parsed.clause_id, verdict);
+
+  // ── Step 7 — finalize conductor_log row + (if pass_with_amendments) enqueue ──
   let enqueueResult = { enqueued: 0, errors: 0 };
   if (verdict === "pass_with_amendments" && sentinel.amendments_suggested.length > 0) {
     enqueueResult = await enqueueFollowupAmendments({
