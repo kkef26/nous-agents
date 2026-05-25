@@ -4,7 +4,7 @@
 // Replaces the inline stubs in index.ts. Both handlers tolerate empty tables
 // (return zero/null) and surface DB errors as 500 responses.
 
-import { getDb } from "../_common/db.ts";
+import { getSupabaseClient } from "../_common/db.ts";
 
 const VERSION = "conductor-v0.1.0";
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -20,8 +20,7 @@ export async function handleStatus(req: Request): Promise<Response> {
     return jsonResponse({ error: "method_not_allowed", allow: "GET" }, 405);
   }
 
-  const db = getDb();
-  const nous = db.schema("nous");
+  const nous = getSupabaseClient();
 
   // Last run + 24h window come from the same table; the active-fuses count is
   // independent. Run them in parallel.
@@ -98,8 +97,7 @@ export async function handleLog(req: Request): Promise<Response> {
 
   const afterRunId = searchParams.get("after_run_id");
 
-  const db = getDb();
-  const nous = db.schema("nous");
+  const nous = getSupabaseClient();
 
   // Cursor: anchor on the created_at of after_run_id, then return strictly older rows.
   let cursorTimestamp: string | null = null;
