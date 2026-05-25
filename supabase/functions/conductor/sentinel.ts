@@ -120,6 +120,12 @@ function stripJsonFences(s: string): string {
   // ```json and bare ``` fences. Match is non-greedy so trailing prose is safe.
   const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) return fenced[1].trim();
+  // Fallback: model omitted closing fence — extract first { to last }
+  const firstBrace = s.indexOf("{");
+  const lastBrace = s.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return s.slice(firstBrace, lastBrace + 1);
+  }
   return s.trim();
 }
 
