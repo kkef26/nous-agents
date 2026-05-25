@@ -267,6 +267,9 @@ async function evaluateAC(
   owner: string,
   repo: string,
 ): Promise<ACEvaluation> {
+  if (!ac.text) {
+    return { id: ac.id || "unknown", text: "(missing)", result: "warn" as PillarResult, detail: "AC text undefined — skipped" };
+  }
   const lower = ac.text.toLowerCase();
   void lower;
 
