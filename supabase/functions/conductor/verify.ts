@@ -495,6 +495,44 @@ async function enqueueFollowupAmendments(opts: {
   }
 }
 
+// ─── Status stamping (AGT.2.2 Part B — carwash position handoff) ───────────
+
+/**
+ * Update nous.bible_clauses.status based on the resolved verdict so the
+ * two-phase status model (AGT.2.1) reflects the conductor's decision.
+ *
+ *   pass / pass_with_amendments → 'verified'   (ready for merge.ts to stamp 'shipped')
+ *   fail_tactical / fail_strategic → 'build_failed' (sweeper picks up for amend/escalate)
+ *   hold_for_review → no change (compile broken, Kosta gate)
+ *
+ * Best-effort: a write failure logs but does not change the verdict — the
+ * conductor_log row is still the canonical record of what happened.
+ */
+async function stampClauseStatusFromVerdict(
+  clause_id: string,
+  verdict: VerifyVerdict,
+): Promise<void> {
+  let newStatus: string | null = null;
+  if (verdict === "pass" || verdict === "pass_with_amendments") {
+    newStatus = "verified";
+  } else if (verdict === "fail_tactical" || verdict === "fail_strategic") {
+    newStatus = "build_failed";
+  }
+  if (!newStatus) return;
+
+  // deno-lint-ignore no-explicit-any
+  const sb = getSupabaseClient() as any;
+  const { error } = await sb
+    .from("bible_clauses")
+    .update({ status: newStatus, updated_at: new Date().toISOString() })
+    .eq("id", clause_id);
+  if (error) {
+    console.error(
+      `[verify] stampClauseStatusFromVerdict(${clause_id} → ${newStatus}) failed: ${error.message}`,
+    );
+  }
+}
+
 // ─── handleVerify ────────────────────────────────────────────────────────────
 
 export async function handleVerify(req: Request): Promise<Response> {
@@ -653,7 +691,12 @@ export async function handleVerify(req: Request): Promise<Response> {
   const verdict = verdictResult.verdict;
   const override_reason = verdictResult.override_reason;
 
-  // ── Step 6 — finalize conductor_log row + (if pass_with_amendments) enqueue ──
+  // ── Step 6 — stamp bible_clauses.status from verdict (AGT.2.2 Part B) ────
+  // Update the clause to its new carwash position before finalizing the log
+  // so the user-visible status reflects the decision even if log write fails.
+  await stampClauseStatusFromVerdict(parsed.clause_id, verdict);
+
+  // ── Step 7 — finalize conductor_log row + (if pass_with_amendments) enqueue ──
   let enqueueResult = { enqueued: 0, errors: 0 };
   if (verdict === "pass_with_amendments" && sentinel.amendments_suggested.length > 0) {
     enqueueResult = await enqueueFollowupAmendments({
