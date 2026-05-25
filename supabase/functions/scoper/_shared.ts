@@ -123,7 +123,7 @@ export async function insertDecisionQueue(
       question,
       context,
       urgency: "blocking",
-      status: "open",
+      status: "pending",
       agent_id: "scoper",
     })
     .select("id")
