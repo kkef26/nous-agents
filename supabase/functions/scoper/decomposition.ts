@@ -419,7 +419,7 @@ async function callEnrichmentLLM(userMessage: string): Promise<{
   }
 
   const requestBody = {
-    model: "opus",
+    model: "sonnet",
     max_tokens: 8192,
     system: ENRICHMENT_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
