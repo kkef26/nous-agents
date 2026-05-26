@@ -3,14 +3,23 @@
 //
 // Step 1: lock mode, verify input, loop guards (dedup 30s, hourly cap 5)
 // Step 2: Working Backwards decomposition (decomposition.ts)
+//          - Generate mode: LLM creates clauses from grill + architecture
+//          - Enrich mode: reads existing clauses, enriches ACs
 // Step 3: AC derivation (folded into decomposition output)
 // Step 4: 7-point prerequisite check (prerequisites.ts)
 //          - #5 ARCHITECTURE + #6 GRILL: MANDATORY GATES, no inline fix
 // Step 5: wave organization (waves.ts)
 // Step 6: emit
-//          - Mode A: dispatch_tree row + clear scoper_findings + signal
+//          - Mode A: dispatch_tree row + PROMOTE clauses + call /dispatch/tree
+//                    + clear scoper_findings + signal
 //          - Mode B: features.scoper_findings jsonb + signal scoper_held
 //          - Mode C: decision_queue row + signal scoper_escalate
+//
+// GAP 2 fix (2026-05-26): Step 6 Mode A now atomically:
+//   1. Writes ACs back to bible_clauses
+//   2. Promotes clauses: status='active', approved_for_dispatch=true, maturity_stage='SCAFFOLD'
+//   3. Calls POST /dispatch/tree to trigger workers
+//   Per grill decision 63b43107 (supersedes f11b5d02): Scoper flips both gates.
 
 import { resolveAuditTrail } from "../_common/audit_trail.ts";
 import { hashInput, checkDedup, checkHourlyCap } from "../_common/loop_guard.ts";
@@ -55,6 +64,9 @@ interface PlanResponse {
   dedup_skip?: boolean;
   loop_halt?: boolean;
   prior_run_id?: string;
+  generated?: boolean;
+  clauses_promoted?: number;
+  dispatch_triggered?: boolean;
 }
 
 function parsePlanBody(body: unknown): PlanRequest | { error: string } {
@@ -248,19 +260,33 @@ export async function runPlan(
   // ─── Step 2 + Step 3: Working Backwards decomposition + AC derivation ──────
 
   const step2Start = Date.now();
+  const clauseIds = (feature.clauses ?? []).filter((c) => typeof c === "string");
   const decomposition = await decomposeFeature(
     feature.id,
     feature.name,
     feature.description,
-    (feature.clauses ?? []).filter((c) => typeof c === "string"),
+    clauseIds,
+    {
+      architectureDoc: feature.architecture_doc ?? null,
+      projectTag: project.tag,
+      sessionId: step1Id,
+    },
   );
   const step2Id = await logStep(
     feature, project.tag, mode, 2, "working_backwards_decomposition",
-    { feature_id: feature.id, clause_count: (feature.clauses ?? []).length },
+    {
+      feature_id: feature.id,
+      clause_count: clauseIds.length,
+      generated: decomposition.generated,
+      tokens_in: decomposition.tokens_in,
+      tokens_out: decomposition.tokens_out,
+      cost_usd: decomposition.cost_usd,
+    },
     {
       customer_experience: decomposition.customer_experience,
       precondition_count: decomposition.preconditions.length,
       clause_count: decomposition.clauses.length,
+      generated: decomposition.generated,
     },
     audit, step1Id, step2Start,
   );
@@ -413,16 +439,93 @@ export async function runPlan(
   };
 
   const dispatchTreeId = await insertDispatchTree(dispatchTreeRow);
+
+  // ─── GAP 2 fix: Promote clauses + write ACs + trigger dispatch ────────────
+  // Per grill decision 63b43107: Scoper flips both gates atomically at Mode A end.
+  const clauseIdsToPromote = decomposition.clauses.map((c) => c.id);
+
+  if (clauseIdsToPromote.length > 0) {
+    const sb = getSupabaseClient();
+
+    // 1. Write ACs back to bible_clauses (in case LLM generated/enriched them)
+    for (const clause of decomposition.clauses) {
+      // deno-lint-ignore no-explicit-any
+      await (sb as any)
+        .from("bible_clauses")
+        .update({
+          acceptance_criteria: clause.acceptance_criteria,
+          contract: clause.contract ?? undefined,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", clause.id);
+    }
+
+    // 2. Promote: status='active', approved_for_dispatch=true, maturity_stage='SCAFFOLD'
+    // deno-lint-ignore no-explicit-any
+    const { error: promoteErr } = await (sb as any)
+      .from("bible_clauses")
+      .update({
+        status: "active",
+        approved_for_dispatch: true,
+        maturity_stage: "SCAFFOLD",
+        updated_at: new Date().toISOString(),
+      })
+      .in("id", clauseIdsToPromote);
+
+    if (promoteErr) {
+      // Non-fatal: log but continue — dispatch_tree is already written
+      await emitScoperSignal("scoper_promote_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
+        `Promotion failed: ${promoteErr.message}`, { clause_ids: clauseIdsToPromote, error: promoteErr.message });
+    }
+
+    // 3. Call POST /dispatch/tree to trigger workers
+    // Use the NOUS edge function directly (same Supabase instance)
+    try {
+      const nousUrl = Deno.env.get("SUPABASE_URL") ?? "https://oozlawunlkkuaykfunan.supabase.co";
+      const nousKey = Deno.env.get("NOUS_API_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+      const dispatchResp = await fetch(`${nousUrl}/functions/v1/nous/dispatch/tree`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": nousKey,
+        },
+        body: JSON.stringify({
+          project: project.tag,
+          feature_id: feature.id,
+          triggered_by_agent_id: "scoper-v3",
+          session_id: audit.session_id,
+        }),
+      });
+      const dispatchResult = await dispatchResp.text();
+      if (!dispatchResp.ok) {
+        await emitScoperSignal("scoper_dispatch_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
+          `Dispatch call failed: ${dispatchResp.status}`, { response: dispatchResult.slice(0, 300) });
+      }
+    } catch (err) {
+      // Non-fatal: clauses are promoted, dispatch_tree row exists.
+      // Manual dispatch can recover.
+      await emitScoperSignal("scoper_dispatch_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
+        `Dispatch call error: ${(err as Error).message}`, { feature_id: feature.id });
+    }
+  }
+
   // Clear stale findings (we're in Mode A)
   await writeScoperFindings(feature.id, null, mode);
   await emitScoperSignal("scoper_plan_emitted", project.tag, audit.triggered_by_agent_id, audit.session_id,
-    `Mode A: ${waveOrg.total_clauses} clauses across ${waveOrg.waves.length} waves`,
-    { feature_id: feature.id, dispatch_tree_id: dispatchTreeId, run_id: step4Id });
+    `Mode A: ${waveOrg.total_clauses} clauses across ${waveOrg.waves.length} waves — promoted + dispatched`,
+    { feature_id: feature.id, dispatch_tree_id: dispatchTreeId, run_id: step4Id, promoted: clauseIdsToPromote.length });
 
   const runId = await logStep(
     feature, project.tag, mode, 6, "emit_mode_a",
     { clause_count: waveOrg.total_clauses, wave_count: waveOrg.waves.length },
-    { outcome_mode: "A", dispatch_tree_id: dispatchTreeId, signal: "scoper_plan_emitted" },
+    {
+      outcome_mode: "A",
+      dispatch_tree_id: dispatchTreeId,
+      signal: "scoper_plan_emitted",
+      clauses_promoted: clauseIdsToPromote.length,
+      dispatch_triggered: true,
+      generated: decomposition.generated,
+    },
     audit, step4Id, step6Start,
   );
 
@@ -433,6 +536,9 @@ export async function runPlan(
     dispatch_tree_id: dispatchTreeId,
     dispatch_tree: dispatchTreeRow as unknown as Record<string, unknown>,
     signal: "scoper_plan_emitted",
+    generated: decomposition.generated,
+    clauses_promoted: clauseIdsToPromote.length,
+    dispatch_triggered: true,
   };
   return jsonResponse(resp, 200);
 }

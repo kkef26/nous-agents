@@ -6,9 +6,13 @@
 // are MANDATORY GATES — missing either = automatic Mode B, no exception
 // (per Scoper v3 persona spec and ARCHITECTURE.md "Scoper cannot bypass the
 // grill gate or architecture gate (both MANDATORY)").
+//
+// GAP 3 fix (2026-05-26): Point #2 staging branch probe now uses git refs API
+// instead of README.md existence check. Prior approach was fragile — repos
+// without README.md failed even if staging branch existed.
 
 import { getSupabaseClient } from "../_common/db.ts";
-import { getFileContent } from "../_common/github.ts";
+import { getFileContent, getRef } from "../_common/github.ts";
 
 const GITHUB_OWNER = "kkef26";
 
@@ -74,15 +78,14 @@ async function checkStagingBranch(p: ProjectRow): Promise<CheckOutcome> {
     };
   }
   try {
-    const { content } = await getFileContent(
-      GITHUB_OWNER,
-      p.canonical_repo.split("/")[1] ?? p.canonical_repo,
-      "README.md",
-      "staging",
-    );
+    // GAP 3 fix: use git refs API instead of README.md existence check.
+    // GET /repos/{owner}/{repo}/git/refs/heads/staging returns the ref object
+    // if the branch exists, 404 if it doesn't.
+    const repo = p.canonical_repo.split("/")[1] ?? p.canonical_repo;
+    const ref = await getRef(GITHUB_OWNER, repo, "heads/staging");
     return {
       point: 2, name: "staging_branch", result: "pass", gate: "soft",
-      detail: `staging branch readable (${content.length} bytes README sampled)`,
+      detail: `staging branch exists (sha=${typeof ref === "object" && ref ? (ref as Record<string, unknown>).sha ?? (ref as Record<string, unknown>).object?.toString() : "verified"})`,
     };
   } catch (err) {
     return {
