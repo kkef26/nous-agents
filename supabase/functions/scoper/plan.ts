@@ -272,6 +272,9 @@ export async function runPlan(
       sessionId: step1Id,
     },
   );
+  // Derive model_used from token counts: if LLM was called, tokens > 0
+  const llmModelUsed = (decomposition.tokens_in ?? 0) > 0 ? "claude-opus-4-20250514" : undefined;
+
   const step2Id = await logStep(
     feature, project.tag, mode, 2, "working_backwards_decomposition",
     {
@@ -287,8 +290,16 @@ export async function runPlan(
       precondition_count: decomposition.preconditions.length,
       clause_count: decomposition.clauses.length,
       generated: decomposition.generated,
+      llm_enriched: !decomposition.generated && (decomposition.tokens_in ?? 0) > 0,
     },
     audit, step1Id, step2Start,
+    // Populate top-level scoper_log columns for observability
+    {
+      model_used: llmModelUsed,
+      tokens_in: decomposition.tokens_in,
+      tokens_out: decomposition.tokens_out,
+      estimated_cost_usd: decomposition.cost_usd,
+    },
   );
   const _step3Id = await logStep(
     feature, project.tag, mode, 3, "ac_derivation",
@@ -447,16 +458,20 @@ export async function runPlan(
   if (clauseIdsToPromote.length > 0) {
     const sb = getSupabaseClient();
 
-    // 1. Write ACs back to bible_clauses (in case LLM generated/enriched them)
+    // 1. Write ACs + contract back to bible_clauses (LLM-enriched or generated)
     for (const clause of decomposition.clauses) {
+      const updatePayload: Record<string, unknown> = {
+        acceptance_criteria: clause.acceptance_criteria,
+        updated_at: new Date().toISOString(),
+      };
+      // Only overwrite contract if LLM actually produced one
+      if (clause.contract) {
+        updatePayload.contract = clause.contract;
+      }
       // deno-lint-ignore no-explicit-any
       await (sb as any)
         .from("bible_clauses")
-        .update({
-          acceptance_criteria: clause.acceptance_criteria,
-          contract: clause.contract ?? undefined,
-          updated_at: new Date().toISOString(),
-        })
+        .update(updatePayload)
         .eq("id", clause.id);
     }
 
@@ -525,6 +540,8 @@ export async function runPlan(
       clauses_promoted: clauseIdsToPromote.length,
       dispatch_triggered: true,
       generated: decomposition.generated,
+      llm_enriched: !decomposition.generated && (decomposition.tokens_in ?? 0) > 0,
+      total_tokens: (decomposition.tokens_in ?? 0) + (decomposition.tokens_out ?? 0),
     },
     audit, step4Id, step6Start,
   );
@@ -566,6 +583,12 @@ async function logStep(
   audit: AuditTrail,
   parent_run_id: string,
   start_ms: number,
+  topLevelFields?: Partial<{
+    model_used: string;
+    tokens_in: number;
+    tokens_out: number;
+    estimated_cost_usd: number;
+  }>,
 ): Promise<string> {
   return await writeScoperStep({
     feature_id: feature.id,
@@ -580,5 +603,6 @@ async function logStep(
     session_id: audit.session_id,
     parent_run_id,
     duration_ms: Date.now() - start_ms,
+    ...(topLevelFields ?? {}),
   });
 }
