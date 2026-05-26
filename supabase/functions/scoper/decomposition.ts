@@ -766,21 +766,31 @@ async function callDecompositionLLM(userMessage: string): Promise<{
   }
 
   const requestBody = {
-    model: "opus",
+    model: "sonnet",
     max_tokens: 8192,
     system: DECOMPOSITION_SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
     account: "c2",
   };
 
-  const response = await fetch(`${proxyUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-    },
-    body: JSON.stringify(requestBody),
-  });
+  // 90s timeout — edge function wall time is ~150s, leave margin
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90_000);
+
+  let response: Response;
+  try {
+    response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const raw = await response.text();
   if (!response.ok) {
