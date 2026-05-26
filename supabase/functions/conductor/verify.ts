@@ -229,6 +229,59 @@ async function countPriorTacticalAttempts(clause_id: string): Promise<number> {
 }
 
 /**
+ * Fetch the list of files the worker committed for this dispatch.
+ * Returns null if the column is empty or the dispatch doesn't exist —
+ * callers treat null as "no scope filter, use full diff" for backward
+ * compatibility with dispatches that predate this column.
+ */
+async function fetchCommittedFiles(dispatch_id: string): Promise<string[] | null> {
+  // deno-lint-ignore no-explicit-any
+  const sb = getSupabaseClient() as any;
+  try {
+    const { data } = await sb
+      .from("dispatch_queue")
+      .select("committed_files")
+      .eq("id", dispatch_id)
+      .maybeSingle();
+    const files = data?.committed_files;
+    if (Array.isArray(files) && files.length > 0) return files;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Scope a full repo compare to only the files this dispatch touched.
+ * If committedFiles is null (pre-column dispatches), returns the
+ * original compare unmodified for backward compatibility.
+ *
+ * This fixes the "scope pollution" bug where verifying clause A against
+ * a staging diff that also contains clause B/C/D files caused sentinel
+ * to flag files from other clauses as missing from A.
+ */
+function scopeCompareToClause(
+  cmp: GitHubCompare,
+  committedFiles: string[] | null,
+): GitHubCompare {
+  if (!committedFiles || committedFiles.length === 0) return cmp;
+  const fileSet = new Set(committedFiles);
+  const filtered = cmp.files.filter((f) => fileSet.has(f.filename));
+  // If filtering produces zero files, fall back to full diff — the worker
+  // may have recorded paths slightly differently (with/without leading slash).
+  if (filtered.length === 0) {
+    console.warn(
+      `[verify] scopeCompareToClause: committed_files (${committedFiles.length}) matched 0 of ${cmp.files.length} compare files — falling back to full diff`,
+    );
+    return cmp;
+  }
+  console.log(
+    `[verify] scopeCompareToClause: filtered ${cmp.files.length} files → ${filtered.length} (committed_files scope)`,
+  );
+  return { ...cmp, files: filtered };
+}
+
+/**
  * Produce a single concatenated diff text from the GitHub compare response.
  * Each file's patch is prefaced with the filename so the cold-reader (and
  * Sentinel) can correlate hunks to files.
@@ -590,7 +643,9 @@ export async function handleVerify(req: Request): Promise<Response> {
   const acs: ACRow[] = Array.isArray(clause.acceptance_criteria) ? clause.acceptance_criteria : [];
   const { owner, repo } = await resolveRepo(clause.project);
 
-  const compare = await compareCommits(owner, repo, "main", "staging");
+  const fullCompare = await compareCommits(owner, repo, "main", "staging");
+  const committedFiles = await fetchCommittedFiles(parsed.dispatch_id);
+  const compare = scopeCompareToClause(fullCompare, committedFiles);
   const diff_text = flattenDiff(compare);
   const churn = totalChurn(compare);
 
