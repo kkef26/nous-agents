@@ -406,39 +406,62 @@ Use the EXACT clause IDs shown above. Do NOT rename them.`);
   return parts.join("\n");
 }
 
+// ── Direct Anthropic API helper (bypasses station-proxy — Deno Deploy can't reach HTTP:8095) ──
+async function getAnthropicApiKey(): Promise<string> {
+  const envKey = Deno.env.get("C2_ANTHROPIC_API_KEY") ?? Deno.env.get("ANTHROPIC_API_KEY");
+  if (envKey) return envKey;
+  // Fallback: read from nous.config table
+  const sb = getSupabaseClient();
+  // deno-lint-ignore no-explicit-any
+  const { data } = await (sb as any).from("config").select("value").eq("key", "C2_ANTHROPIC_API_KEY").single();
+  if (data?.value) return data.value;
+  throw new Error("No Anthropic API key found in env or nous.config");
+}
+
+async function callAnthropicDirect(
+  systemPrompt: string,
+  userMessage: string,
+  maxTokens: number = 8192,
+): Promise<{ raw: string; response: Response }> {
+  const apiKey = await getAnthropicApiKey();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90_000);
+
+  let response: Response;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: maxTokens,
+        system: systemPrompt,
+        messages: [{ role: "user", content: userMessage }],
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Anthropic API ${response.status}: ${raw.slice(0, 400)}`);
+  }
+  return { raw, response };
+}
+
 async function callEnrichmentLLM(userMessage: string): Promise<{
   parsed: EnrichmentLLMOutput;
   tokens_in: number;
   tokens_out: number;
   cost_usd: number;
 }> {
-  const proxyUrl = Deno.env.get("STATION_PROXY_URL");
-  const apiKey = Deno.env.get("NOUS_API_KEY");
-  if (!proxyUrl || !apiKey) {
-    throw new Error("STATION_PROXY_URL or NOUS_API_KEY not set — cannot call LLM for enrichment");
-  }
-
-  const requestBody = {
-    model: "sonnet",
-    max_tokens: 8192,
-    system: ENRICHMENT_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
-    account: "c2",
-  };
-
-  const response = await fetch(`${proxyUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-    },
-    body: JSON.stringify(requestBody),
-  });
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`station-proxy enrichment ${response.status}: ${raw.slice(0, 400)}`);
-  }
+  const { raw } = await callAnthropicDirect(ENRICHMENT_SYSTEM_PROMPT, userMessage);
 
   let apiResponse: AnthropicResponseLike & {
     content?: Array<{ type: string; text: string }>;
@@ -446,7 +469,7 @@ async function callEnrichmentLLM(userMessage: string): Promise<{
   try {
     apiResponse = JSON.parse(raw);
   } catch (err) {
-    throw new Error(`station-proxy returned non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
+    throw new Error(`Anthropic returned non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
   }
 
   const textBlock = apiResponse.content?.find((c) => c.type === "text");
@@ -759,43 +782,7 @@ async function callDecompositionLLM(userMessage: string): Promise<{
   tokens_out: number;
   cost_usd: number;
 }> {
-  const proxyUrl = Deno.env.get("STATION_PROXY_URL");
-  const apiKey = Deno.env.get("NOUS_API_KEY");
-  if (!proxyUrl || !apiKey) {
-    throw new Error("STATION_PROXY_URL or NOUS_API_KEY not set — cannot call LLM");
-  }
-
-  const requestBody = {
-    model: "sonnet",
-    max_tokens: 8192,
-    system: DECOMPOSITION_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
-    account: "c2",
-  };
-
-  // 90s timeout — edge function wall time is ~150s, leave margin
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 90_000);
-
-  let response: Response;
-  try {
-    response = await fetch(`${proxyUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-      },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`station-proxy ${response.status}: ${raw.slice(0, 400)}`);
-  }
+  const { raw } = await callAnthropicDirect(DECOMPOSITION_SYSTEM_PROMPT, userMessage);
 
   let apiResponse: AnthropicResponseLike & {
     content?: Array<{ type: string; text: string }>;
@@ -803,7 +790,7 @@ async function callDecompositionLLM(userMessage: string): Promise<{
   try {
     apiResponse = JSON.parse(raw);
   } catch (err) {
-    throw new Error(`station-proxy returned non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
+    throw new Error(`Anthropic returned non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
   }
 
   const textBlock = apiResponse.content?.find((c) => c.type === "text");
