@@ -261,17 +261,33 @@ export async function runPlan(
 
   const step2Start = Date.now();
   const clauseIds = (feature.clauses ?? []).filter((c) => typeof c === "string");
-  const decomposition = await decomposeFeature(
-    feature.id,
-    feature.name,
-    feature.description,
-    clauseIds,
-    {
-      architectureDoc: feature.architecture_doc ?? null,
-      projectTag: project.tag,
-      sessionId: step1Id,
-    },
-  );
+  let decomposition: Awaited<ReturnType<typeof decomposeFeature>>;
+  try {
+    decomposition = await decomposeFeature(
+      feature.id,
+      feature.name,
+      feature.description,
+      clauseIds,
+      {
+        architectureDoc: feature.architecture_doc ?? null,
+        projectTag: project.tag,
+        sessionId: step1Id,
+      },
+    );
+  } catch (decompErr) {
+    // Diagnostic: log the actual error to scoper_log so we can see what killed step 2
+    const errMsg = decompErr instanceof Error ? decompErr.message : String(decompErr);
+    const errStack = decompErr instanceof Error ? decompErr.stack : undefined;
+    console.error(`[scoper] decomposeFeature FAILED: ${errMsg}`);
+    await logStep(
+      feature, project.tag, mode, 2, "working_backwards_decomposition",
+      { feature_id: feature.id, clause_count: clauseIds.length, error_diagnostic: true },
+      { error: errMsg, stack: errStack?.slice(0, 500) },
+      audit, step1Id, step2Start,
+      { error: `decomposeFeature crashed: ${errMsg}` },
+    );
+    throw decompErr;
+  }
   // Derive model_used from token counts: if LLM was called, tokens > 0
   const llmModelUsed = (decomposition.tokens_in ?? 0) > 0 ? "claude-opus-4-20250514" : undefined;
 
