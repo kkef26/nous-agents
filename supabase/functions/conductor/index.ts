@@ -9,7 +9,7 @@
 //   GET  /log          — conductor_log reader
 
 import { handleLog, handleStatus } from "./status.ts";
-import { handleConductorMerge } from "./merge.ts";
+import { handleMerge } from "./merge.ts";
 import { handleVerify } from "./verify.ts";
 import { getSupabaseClient } from "../_common/db.ts";
 
@@ -42,7 +42,7 @@ async function handleRun(req: Request): Promise<Response> {
     body: JSON.stringify(body),
   });
   if (mode === "verify") return await handleVerify(proxied);
-  return await handleConductorMerge(proxied);
+  return await handleMerge(proxied);
 }
 
 // ─── Batch verify: find completed dispatches not yet verified ────────────────
@@ -241,7 +241,7 @@ async function handleBatchMerge(req: Request): Promise<Response> {
           locked_by: "conductor-batch-merge",
         }),
       });
-      const resp = await handleConductorMerge(mergeReq);
+      const resp = await handleMerge(mergeReq);
       const data = await resp.json();
       results.push({
         project: proj.tag,
