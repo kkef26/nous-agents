@@ -16,8 +16,8 @@
 import {
   costFromTokens,
   tokensFromResponse,
-} from "../_common/cost.ts";
-import type { AnthropicResponseLike, PillarOutcome } from "../_common/types.ts";
+} from "../common/cost.ts";
+import type { AnthropicResponseLike, PillarOutcome } from "../common/types.ts";
 
 // ─── Local types ─────────────────────────────────────────────────────────────
 
@@ -356,8 +356,8 @@ async function callSentinel(opts: {
 export async function scoreWith5Axis(
   opts: ScoreWith5AxisInput,
 ): Promise<ScoreWith5AxisResult> {
-  const proxyUrl = Deno.env.get("STATION_PROXY_URL") ?? "http://5.161.190.85:8095";
-  const apiKey = Deno.env.get("STATION_PROXY_API_KEY");
+  const proxyUrl = process.env.STATION_PROXY_URL ?? "http://5.161.190.85:8095";
+  const apiKey = process.env.STATION_PROXY_API_KEY;
   if (!apiKey) {
     throw new Error("STATION_PROXY_API_KEY not set in environment");
   }
