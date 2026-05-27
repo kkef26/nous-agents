@@ -1,27 +1,28 @@
 #!/bin/bash
-# Deploy scoper + conductor to Hetzner
-# Run from the Hetzner server at /opt/nous-agents/hetzner
+# Deploy scoper + conductor to Hetzner.
+# Run from the Hetzner server at /opt/nous-agents/hetzner.
 set -e
 
-echo "[deploy] Installing dependencies..."
-npm install --production=false
-
-echo "[deploy] Creating log directory..."
 mkdir -p /var/log/nous
 
-echo "[deploy] Stopping existing services..."
+for svc in scoper conductor; do
+  echo "[deploy] Building $svc..."
+  pushd "$svc" >/dev/null
+  npm install --no-audit --no-fund
+  npx tsc
+  popd >/dev/null
+done
+
+echo "[deploy] Restarting services via PM2..."
 pm2 delete scoper 2>/dev/null || true
 pm2 delete conductor 2>/dev/null || true
-
-echo "[deploy] Starting scoper (port 8790) + conductor (port 8791)..."
-pm2 start ecosystem.config.cjs
-
-echo "[deploy] Saving PM2 config..."
+pm2 start scoper/ecosystem.config.js
+pm2 start conductor/ecosystem.config.js
 pm2 save
 
 echo "[deploy] Verifying..."
-sleep 3
-curl -s http://localhost:8790/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Scoper: {d}')"
-curl -s http://localhost:8791/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Conductor: {d}')"
+sleep 2
+curl -fsS http://localhost:8090/health && echo
+curl -fsS http://localhost:8091/health && echo
 
 echo "[deploy] Done."
