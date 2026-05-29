@@ -200,6 +200,46 @@ export interface ConfigRow {
   value: unknown;
 }
 
+// ─── Grill decisions table (used by source_material.ts + prerequisites.ts) ───
+
+export interface GrillDecisionRow {
+  id: string;
+  feature_id: string | null;
+  project: string | null;
+  decision: string;
+  rationale: string | null;
+  category: string | null;
+  severity: string | null;
+  session_id: string | null;
+  created_at: string;
+}
+
+// ─── Library artifacts table (architecture docs, grill resolutions) ──────────
+
+export interface LibraryArtifactRow {
+  id: string;
+  project: string | null;
+  title: string | null;
+  content: string | null;
+  artifact_type: string | null;
+  tags: string[] | null;
+  created_at: string;
+}
+
+// ─── Feature source material view (PIPE.CLEANUP D6) ─────────────────────────
+
+export interface FeatureSourceMaterialRow {
+  feature_id: string | null;
+  project: string | null;
+  source_type: string;
+  source_id: string;
+  title: string | null;
+  content: string | null;
+  category: string | null;
+  severity: string | null;
+  created_at: string | null;
+}
+
 export interface NousDatabase {
   nous: {
     Tables: {
@@ -218,8 +258,22 @@ export interface NousDatabase {
         Insert: ConductorLogRow;
         Update: Partial<ConductorLogRow>;
       };
+      grill_decisions: {
+        Row: GrillDecisionRow;
+        Insert: Omit<GrillDecisionRow, "id" | "created_at"> & { id?: string; created_at?: string };
+        Update: Partial<GrillDecisionRow>;
+      };
+      library_artifacts: {
+        Row: LibraryArtifactRow;
+        Insert: Omit<LibraryArtifactRow, "id" | "created_at"> & { id?: string; created_at?: string };
+        Update: Partial<LibraryArtifactRow>;
+      };
     };
-    Views: Record<string, never>;
+    Views: {
+      feature_source_material: {
+        Row: FeatureSourceMaterialRow;
+      };
+    };
     Functions: Record<string, never>;
     Enums: Record<string, never>;
     CompositeTypes: Record<string, never>;
@@ -326,3 +380,4 @@ export interface VercelBuildLog {
   created: number;
   text: string;
 }
+
