@@ -10,17 +10,9 @@
 // GAP 3 fix (2026-05-26): Point #2 staging branch probe now uses git refs API
 // instead of README.md existence check. Prior approach was fragile — repos
 // without README.md failed even if staging branch existed.
-//
-// PIPE.CLEANUP D3+D6 (2026-05-29): Points #5 and #6 now query source tables
-// (grill_decisions, library_artifacts) directly instead of features row
-// derived fields. Root cause: Cowork never stamped features.grill_completed_at
-// or features.architecture_completed_at, making most features appear ungrilled.
-// The auto-stamp trigger (trg_stamp_feature_grill) covers future writes, but
-// the prereq gates must not depend on derived fields alone.
 
 import { getSupabaseClient } from "../_common/db.ts";
 import { getFileContent, getRef } from "../_common/github.ts";
-import { countGrillDecisions, hasArchitectureDoc } from "../_common/source_material.ts";
 
 const GITHUB_OWNER = "kkef26";
 
@@ -87,6 +79,8 @@ async function checkStagingBranch(p: ProjectRow): Promise<CheckOutcome> {
   }
   try {
     // GAP 3 fix: use git refs API instead of README.md existence check.
+    // GET /repos/{owner}/{repo}/git/refs/heads/staging returns the ref object
+    // if the branch exists, 404 if it doesn't.
     const repo = p.canonical_repo.split("/")[1] ?? p.canonical_repo;
     const ref = await getRef(GITHUB_OWNER, repo, "heads/staging");
     return {
@@ -139,38 +133,21 @@ async function checkCredentials(p: ProjectRow): Promise<CheckOutcome> {
 /**
  * Point #5 — ARCHITECTURE GATE (MANDATORY).
  *
- * PIPE.CLEANUP D3+D6: queries library_artifacts for architecture-tagged docs
- * for this project first (source of truth). Falls back to features row fields,
- * then to ARCHITECTURE.md at repo root. Removes single-point dependency on
- * features.architecture_completed_at which was inconsistently written.
+ * Either the feature row carries architecture_completed_at + architecture_doc
+ * (or architecture_doc_path), OR an ARCHITECTURE.md exists at the repo root.
+ * If neither: hard fail, no inline fix.
  */
 async function checkArchitectureGate(
   f: FeatureRow,
   p: ProjectRow,
 ): Promise<CheckOutcome> {
-  // Primary path: query library_artifacts for architecture docs (D3 Option C)
-  try {
-    const hasDoc = await hasArchitectureDoc(f.project ?? p.tag);
-    if (hasDoc) {
-      return {
-        point: 5, name: "architecture_gate", result: "pass", gate: "mandatory",
-        detail: `architecture doc found in library_artifacts for project=${f.project ?? p.tag}`,
-      };
-    }
-  } catch (err) {
-    // Log but don't fail — fall through to secondary paths
-    console.warn(`[prereq] architecture doc query failed, falling back: ${(err as Error).message}`);
-  }
-
-  // Secondary path: features row (for backward compat with older features)
   if (f.architecture_completed_at && (f.architecture_doc || f.architecture_doc_path)) {
     return {
       point: 5, name: "architecture_gate", result: "pass", gate: "mandatory",
       detail: `feature has architecture (completed_at=${f.architecture_completed_at})`,
     };
   }
-
-  // Tertiary fallback: check ARCHITECTURE.md at repo root
+  // Fallback: check ARCHITECTURE.md at repo root
   if (p.canonical_repo) {
     try {
       const repo = p.canonical_repo.split("/")[1] ?? p.canonical_repo;
@@ -188,75 +165,46 @@ async function checkArchitectureGate(
     } catch (_err) {
       return {
         point: 5, name: "architecture_gate", result: "fail", gate: "mandatory",
-        detail: "no architecture doc in library_artifacts, features row, or repo root ARCHITECTURE.md",
+        detail: "ARCHITECTURE.md missing at repo root AND features.architecture_completed_at is null",
       };
     }
   }
   return {
     point: 5, name: "architecture_gate", result: "fail", gate: "mandatory",
-    detail: "no canonical_repo and no architecture doc in library_artifacts or feature row",
+    detail: "no canonical_repo and no feature.architecture_doc — cannot resolve architecture gate",
   };
 }
 
 /**
  * Point #6 — GRILL GATE (MANDATORY).
  *
- * PIPE.CLEANUP D3: queries grill_decisions table directly instead of relying
- * on features.grill_completed_at (which was never written by Cowork sessions).
- * Counts feature-specific decisions (feature_id = X) + project-wide decisions
- * (feature_id IS NULL AND project = Y). Threshold: >= 4 per grill resolution spec.
- *
- * Falls back to features row fields for backward compat.
+ * features.grill_completed_at must be non-null. grill_decision_count ≥ 4
+ * (depth threshold per grill resolution spec). No inline fix path.
  */
-async function checkGrillGate(f: FeatureRow, p: ProjectRow): Promise<CheckOutcome> {
-  // Primary path: query grill_decisions directly (D3 Option C)
-  try {
-    const { count, featureSpecific, projectWide } = await countGrillDecisions(
-      f.id,
-      f.project ?? p.tag,
-    );
-
-    if (count >= 4) {
-      return {
-        point: 6, name: "grill_gate", result: "pass", gate: "mandatory",
-        detail: `grill depth=${count} (${featureSpecific} feature-specific + ${projectWide} project-wide) >= required 4`,
-      };
-    }
-
-    if (count > 0) {
-      return {
-        point: 6, name: "grill_gate", result: "fail", gate: "mandatory",
-        detail: `grill depth ${count} (${featureSpecific} feature + ${projectWide} project) < required 4`,
-      };
-    }
-  } catch (err) {
-    // Log but don't fail — fall through to features row
-    console.warn(`[prereq] grill_decisions query failed, falling back: ${(err as Error).message}`);
-  }
-
-  // Secondary fallback: features row (for backward compat)
-  if (f.grill_completed_at) {
-    const depth = f.grill_decision_count ?? 0;
-    if (depth >= 4) {
-      return {
-        point: 6, name: "grill_gate", result: "pass", gate: "mandatory",
-        detail: `grill_completed_at=${f.grill_completed_at}, depth=${depth} (from features row fallback)`,
-      };
-    }
+function checkGrillGate(f: FeatureRow): CheckOutcome {
+  if (!f.grill_completed_at) {
     return {
       point: 6, name: "grill_gate", result: "fail", gate: "mandatory",
-      detail: `grill depth ${depth} < required 4 (features row fallback)`,
+      detail: "features.grill_completed_at is null — grilling session not run",
     };
   }
-
+  const depth = f.grill_decision_count ?? 0;
+  if (depth < 4) {
+    return {
+      point: 6, name: "grill_gate", result: "fail", gate: "mandatory",
+      detail: `grill depth ${depth} < required 4 (per grill_resolution spec)`,
+    };
+  }
   return {
-    point: 6, name: "grill_gate", result: "fail", gate: "mandatory",
-    detail: "no grill decisions found in grill_decisions table or features row",
+    point: 6, name: "grill_gate", result: "pass", gate: "mandatory",
+    detail: `grill_completed_at=${f.grill_completed_at}, depth=${depth}`,
   };
 }
 
 async function checkNoOverlap(f: FeatureRow): Promise<CheckOutcome> {
   // #7: feature's clauses should not overlap with active work on other features
+  // in the same project. Simple check: any clause already at maturity SHIPPED
+  // / RATIFIED owned by a different feature_id?
   const clauseIds = (f.clauses ?? []).filter((c) => typeof c === "string");
   if (clauseIds.length === 0) {
     return {
@@ -296,16 +244,16 @@ export async function runPrerequisiteChecks(
   feature: FeatureRow,
   project: ProjectRow,
 ): Promise<PrerequisiteSummary> {
-  // All checks run in parallel — both mandatory gates are now async (DB queries).
-  const [c1, c2, c3, c4, c5, c6, c7] = await Promise.all([
+  // Soft checks run in parallel; mandatory gates are sequential and short.
+  const [c1, c2, c3, c4, c5, c7] = await Promise.all([
     checkCanonicalRepo(project),
     checkStagingBranch(project),
     checkDeployConfig(project),
     checkCredentials(project),
     checkArchitectureGate(feature, project),
-    checkGrillGate(feature, project),
     checkNoOverlap(feature),
   ]);
+  const c6 = checkGrillGate(feature);
 
   const outcomes: CheckOutcome[] = [c1, c2, c3, c4, c5, c6, c7];
   const blocking_failures = outcomes.filter((o) => o.result === "fail");
