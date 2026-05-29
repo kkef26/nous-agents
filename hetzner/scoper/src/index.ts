@@ -5,6 +5,7 @@
 //   GET  /status  — liveness + 24h Mode A/B/C counts
 //   GET  /log     — scoper_log reader (cursor + filters)
 //   GET  /health  — basic liveness
+//   POST /deploy  — self-deploy for scoper/conductor services
 
 import express, { type Request as ExpressRequest, type Response as ExpressResponse } from "express";
 import { handleLog, handleStatus } from "./status.js";
@@ -13,6 +14,7 @@ import { handleReplan } from "./replan.js";
 import { writeScoperStep } from "./lib/common/logging.js";
 import { resolveAuditTrail } from "./lib/common/audit_trail.js";
 import { jsonResponse, SCOPER_VERSION } from "./_shared.js";
+import { handleDeploy } from "./deploy.js";
 
 const PORT = parseInt(process.env.SCOPER_PORT || "8090", 10);
 
@@ -114,6 +116,18 @@ app.get("/health", (_req, res) => {
   res.json({ alive: true, service: "scoper-hetzner", port: PORT, version: SCOPER_VERSION });
 });
 
+app.post("/deploy", async (req, res) => {
+  try {
+    const webReq = await expressToWebRequest(req);
+    const webRes = await handleDeploy(webReq);
+    await sendWebResponse(webRes, res);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[scoper] /deploy internal error:", message);
+    res.status(500).json({ error: "internal", message });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: "not_found", path: req.path });
 });
@@ -124,3 +138,4 @@ app.listen(PORT, "0.0.0.0", () => {
 
 // Silence "unused" warning when jsonResponse is referenced indirectly via handlers.
 void jsonResponse;
+
