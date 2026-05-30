@@ -469,9 +469,9 @@ async function callSkeletonLLM(
   const { text, tokens_in, tokens_out } = await callLLM({
     system: SKELETON_SYSTEM_PROMPT,
     userMessage,
-    model: "opus",
+    model: "sonnet",
     max_tokens: 16384,
-    timeout_ms: 300_000,  // opus needs 5min for large features
+    timeout_ms: 180_000,  // sonnet is 3-5x faster than opus  // opus needs 5min for large features
   });
 
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
@@ -543,9 +543,9 @@ async function callBatchEnrichLLM(
   const { text, tokens_in, tokens_out } = await callLLM({
     system: GENERATE_SYSTEM_PROMPT,
     userMessage,
-    model: "opus",
+    model: "sonnet",
     max_tokens: 16384,
-    timeout_ms: 300_000,
+    timeout_ms: 180_000,  // sonnet is 3-5x faster than opus
   });
 
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
