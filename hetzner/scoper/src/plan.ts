@@ -403,6 +403,16 @@ export async function runPlan(
     const sb = getSupabaseClient();
 
     if (decomposition.generated) {
+      // Upsert all unique prefixes into bible_prefixes before clause inserts
+      const uniquePrefixes = [...new Set(decomposition.clauses.map(c => c.prefix))];
+      for (const pfx of uniquePrefixes) {
+        // deno-lint-ignore no-explicit-any
+        await (sb as any).from("bible_prefixes").upsert(
+          { prefix: pfx, project: project.tag, status: "active", minted_at: new Date().toISOString() },
+          { onConflict: "prefix" }
+        );
+      }
+
       for (const clause of decomposition.clauses) {
         const insertPayload = {
           id: clause.id,
