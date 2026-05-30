@@ -448,6 +448,24 @@ function buildSourceContext(
   return parts.join("\n");
 }
 
+async function loadShippedClauses(projectTag: string): Promise<Array<{ id: string; title: string }>> {
+  const sb = getSupabaseClient();
+  // deno-lint-ignore no-explicit-any
+  const { data, error } = await (sb as any)
+    .from("bible_clauses")
+    .select("id, frontmatter")
+    .or(`status.eq.shipped,maturity_stage.eq.SHIPPED`)
+    .order("id", { ascending: true });
+  if (error) {
+    console.error(`[scoper] loadShippedClauses failed: ${error.message}`);
+    return [];
+  }
+  return (data ?? []).map((r: { id: string; frontmatter: Record<string, unknown> | null }) => ({
+    id: r.id,
+    title: (r.frontmatter?.title as string) || r.id,
+  }));
+}
+
 // ─── Generate mode: injection mold pattern ──────────────────────────────────
 
 async function callSkeletonLLM(
@@ -455,8 +473,14 @@ async function callSkeletonLLM(
   prefix: string,
   featureId: string,
   project: string,
+  shippedClauses: Array<{ id: string; title: string }> = [],
 ): Promise<{ stubs: ClauseStub[]; customer_experience: string; tokens_in: number; tokens_out: number; cost_usd: number }> {
-  const userMessage = sourceContext + `\n\n## Instructions\nDecompose this feature into clause STUBS.\nUse clause ID prefix: ${prefix} (e.g., ${prefix}.1, ${prefix}.2, ...)\nFoundation/infrastructure clauses come first (lower sequence_order).\nEvery grill decision must be traceable to at least one clause stub.`;
+  let shippedSection = "";
+  if (shippedClauses.length > 0) {
+    const shippedList = shippedClauses.slice(0, 100).map(c => `- ${c.id}: ${c.title}`).join("\n");
+    shippedSection = `\n\n## Already Shipped (DO NOT regenerate these — they are DONE)\n${shippedList}\n\nIMPORTANT: Do NOT create stubs for work that overlaps with the shipped clauses above. Only generate stubs for NEW work not yet covered.`;
+  }
+  const userMessage = sourceContext + shippedSection + `\n\n## Instructions\nDecompose this feature into clause STUBS for UNSHIPPED work only.\nUse clause ID prefix: ${prefix} (e.g., ${prefix}.1, ${prefix}.2, ...)\nFoundation/infrastructure clauses come first (lower sequence_order).\nEvery grill decision must be traceable to at least one clause stub.\nSkip any work already covered by the shipped clauses listed above.`;
 
   await emitPipelineEvent({
     feature_id: featureId,
@@ -654,6 +678,17 @@ async function generateClausesFromSource(
   projectTag: string,
 ): Promise<DecompositionOutput> {
   const sourceMaterial = await loadFeatureSourceMaterial(featureId, projectTag);
+  // Scope check: warn if grill decisions span too many distinct sources (likely needs splitting)
+  const distinctSources = new Set(sourceMaterial.grill_decisions.map(g => g.source_id?.split("-")[0] || "unknown"));
+  if (distinctSources.size > 4) {
+    console.warn(`[scoper] scope warning: ${featureId} has grill decisions from ${distinctSources.size} distinct sources — consider splitting into multiple features`);
+    await emitPipelineEvent({
+      feature_id: featureId, project: projectTag,
+      event_type: "scoper.scope.warning", agent: "scoper", severity: "warn",
+      detail_jsonb: { distinct_sources: distinctSources.size, message: "Feature may be too broad — consider splitting" },
+    });
+  }
+
   if (sourceMaterial.grill_count < 4) {
     console.error(`[scoper] generate mode: insufficient grill decisions (${sourceMaterial.grill_count} < 4) for ${featureId}`);
     return {
@@ -667,8 +702,11 @@ async function generateClausesFromSource(
   const prefix = featureId.includes(".") ? featureId : `${projectTag.toUpperCase()}.${featureId}`;
   const sourceContext = buildSourceContext(featureId, featureName, description, sourceMaterial, projectTag, prefix);
 
+  // Load shipped clauses so skeleton doesn't regenerate completed work
+  const shippedClauses = await loadShippedClauses(projectTag);
+
   // ─── Phase 1: Skeleton ────────────────────────────────────────────────────
-  const skeleton = await callSkeletonLLM(sourceContext, prefix, featureId, projectTag);
+  const skeleton = await callSkeletonLLM(sourceContext, prefix, featureId, projectTag, shippedClauses);
   let totalTokensIn = skeleton.tokens_in;
   let totalTokensOut = skeleton.tokens_out;
   let totalCost = skeleton.cost_usd;
