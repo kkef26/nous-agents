@@ -11,6 +11,7 @@
 // Pipeline events: emits to nous.pipeline_events at each step boundary
 // for carwash live visibility (grill_living_pipeline_protocol_2026-05-29).
 
+import { createHash } from "crypto";
 import { resolveAuditTrail } from "./lib/common/audit_trail.js";
 import { hashInput, checkDedup, checkHourlyCap } from "./lib/common/loop_guard.js";
 import { finalizeStep, writeScoperStep } from "./lib/common/logging.js";
@@ -410,6 +411,7 @@ export async function runPlan(
           critical_path: clause.critical_path, requires: clause.requires, enables: clause.enables,
           acceptance_criteria: clause.acceptance_criteria, body: clause.body,
           contract: clause.contract ?? null, frontmatter: { title: clause.title },
+          hash: createHash("md5").update(clause.body || "").digest("hex"),
           approved_for_dispatch: false,
           created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
         };
@@ -419,6 +421,8 @@ export async function runPlan(
           console.error(`[scoper] failed to insert generated clause ${clause.id}: ${insertErr.message}`);
           await emitScoperSignal("scoper_generate_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
             `Failed to insert clause ${clause.id}: ${insertErr.message}`, { clause_id: clause.id });
+          await emitPipelineEvent({ feature_id: feature.id, project: project.tag, event_type: "scoper.error", agent: "scoper", severity: "error",
+            detail_jsonb: { error: `clause insert failed: ${insertErr.message}`, clause_id: clause.id } });
         }
       }
       // deno-lint-ignore no-explicit-any
