@@ -11,7 +11,6 @@
 // Pipeline events: emits to nous.pipeline_events at each step boundary
 // for carwash live visibility (grill_living_pipeline_protocol_2026-05-29).
 
-import { createHash } from "crypto";
 import { resolveAuditTrail } from "./lib/common/audit_trail.js";
 import { hashInput, checkDedup, checkHourlyCap } from "./lib/common/loop_guard.js";
 import { finalizeStep, writeScoperStep } from "./lib/common/logging.js";
@@ -403,58 +402,26 @@ export async function runPlan(
     const sb = getSupabaseClient();
 
     if (decomposition.generated) {
-      // Upsert all unique prefixes into bible_prefixes before clause inserts
-      const uniquePrefixes = [...new Set(decomposition.clauses.map(c => c.prefix))];
-      for (const pfx of uniquePrefixes) {
-        // deno-lint-ignore no-explicit-any
-        await (sb as any).from("bible_prefixes").upsert(
-          { prefix: pfx, project: project.tag, status: "active", minted_at: new Date().toISOString() },
-          { onConflict: "prefix" }
-        );
-      }
-
+      // Use canonical create_generated_clause() RPC — handles prefix FK, hash, all NOT NULL defaults
       for (const clause of decomposition.clauses) {
-        const insertPayload = {
-          id: clause.id,
-          prefix: clause.prefix,
-          parent_id: clause.parent_id || [],
-          feature_id: clause.feature_id,
-          sequence_order: clause.sequence_order,
-          maturity_stage: "SCAFFOLD",
-          status: "draft",
-          clause_type: clause.clause_type,
-          critical_path: clause.critical_path ?? false,
-          requires: clause.requires || [],
-          enables: clause.enables || [],
-          acceptance_criteria: clause.acceptance_criteria || [],
-          body: clause.body || "",
-          contract: clause.contract ?? null,
-          frontmatter: { title: clause.title },
-          hash: createHash("md5").update(clause.body || "").digest("hex"),
-          approved_for_dispatch: false,
-          // NOT NULL columns that need defaults
-          revision: "r1",
-          birth_session: "scoper-generate",
-          birth_author: "scoper",
-          file_path: `bible/${clause.id}.md`,
-          shipped_in: [],
-          deaths: [],
-          blocks_on_data: [],
-          maturity_log: [],
-          attempt_count: 0,
-          attempt_log: [],
-          domains: [],
-          exclusive_resources: [],
-          conflicts_with: [],
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
         // deno-lint-ignore no-explicit-any
-        const { error: insertErr } = await (sb as any).from("bible_clauses").upsert(insertPayload, { onConflict: "id" });
+        const { error: insertErr } = await (sb as any).rpc("create_generated_clause", {
+          p_id: clause.id,
+          p_prefix: clause.prefix,
+          p_feature_id: clause.feature_id,
+          p_project: project.tag,
+          p_title: clause.title,
+          p_body: clause.body || "",
+          p_clause_type: clause.clause_type || "feature",
+          p_critical_path: clause.critical_path ?? false,
+          p_sequence_order: clause.sequence_order ?? 0,
+          p_requires: clause.requires || [],
+          p_enables: clause.enables || [],
+          p_acceptance_criteria: clause.acceptance_criteria || [],
+          p_contract: clause.contract ?? null,
+        });
         if (insertErr) {
-          console.error(`[scoper] failed to insert generated clause ${clause.id}: ${insertErr.message}`);
-          await emitScoperSignal("scoper_generate_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
-            `Failed to insert clause ${clause.id}: ${insertErr.message}`, { clause_id: clause.id });
+          console.error(`[scoper] create_generated_clause failed for ${clause.id}: ${insertErr.message}`);
           await emitPipelineEvent({ feature_id: feature.id, project: project.tag, event_type: "scoper.error", agent: "scoper", severity: "error",
             detail_jsonb: { error: `clause insert failed: ${insertErr.message}`, clause_id: clause.id } });
         }
