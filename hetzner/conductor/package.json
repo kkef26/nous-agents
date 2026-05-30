@@ -12,7 +12,8 @@
   "dependencies": {
     "express": "^4.21.0",
     "@supabase/supabase-js": "^2.49.0",
-    "@octokit/rest": "^21.0.0"
+    "@octokit/rest": "^21.0.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

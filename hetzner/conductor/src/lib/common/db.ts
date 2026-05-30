@@ -5,6 +5,10 @@
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
+// Node 20 lacks native WebSocket — provide ws as transport for supabase-js realtime.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const ws = require("ws") as typeof import("ws");
+
 // Untyped client — many tables touched (features, dispatch_queue, agent_events, …)
 // are not enumerated in NousDatabase, so callers already cast to any. Keeping the
 // client loosely typed avoids spreading those casts further.
@@ -38,6 +42,7 @@ export function getSupabaseClient(): NousSupabaseClient {
     global: {
       headers: { "x-client-info": "nous-agents/_common/db.ts" },
     },
+    realtime: { transport: ws },
   }) as unknown as NousSupabaseClient;
   cached = client;
   return client;
