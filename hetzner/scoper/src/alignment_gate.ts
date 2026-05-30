@@ -159,6 +159,7 @@ async function callAlignmentLLM(userMessage: string): Promise<{
   cost_usd: number;
 }> {
   const proxyUrl = process.env.STATION_PROXY_URL ?? "http://127.0.0.1:8095";
+  const proxyKey = process.env.STATION_PROXY_KEY ?? process.env.NOUS_API_KEY ?? "";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60_000);
 
@@ -166,7 +167,7 @@ async function callAlignmentLLM(userMessage: string): Promise<{
   try {
     response = await fetch(`${proxyUrl}/v1/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-api-key": proxyKey },
       body: JSON.stringify({
         model: "haiku",
         max_tokens: 4096,

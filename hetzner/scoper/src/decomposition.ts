@@ -416,7 +416,7 @@ async function callEnrichmentLLM(userMessage: string): Promise<{
   try {
     response = await fetch(`${proxyUrl}/v1/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-api-key": proxyKey },
       body: JSON.stringify({
         model: "sonnet",
         max_tokens: 8192,
@@ -758,6 +758,7 @@ async function callGenerateLLM(userMessage: string): Promise<{
   cost_usd: number;
 }> {
   const proxyUrl = process.env.STATION_PROXY_URL ?? "http://127.0.0.1:8095";
+  const proxyKey = process.env.STATION_PROXY_KEY ?? process.env.NOUS_API_KEY ?? "";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 180_000);
 
@@ -765,7 +766,7 @@ async function callGenerateLLM(userMessage: string): Promise<{
   try {
     response = await fetch(`${proxyUrl}/v1/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "x-api-key": proxyKey },
       body: JSON.stringify({
         model: "opus",
         max_tokens: 16384,
