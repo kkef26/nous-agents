@@ -8,7 +8,7 @@ export const SCOPER_VERSION = "scoper-v0.1.0";
 export const DEDUP_WINDOW_SECONDS = 30;
 export const HOURLY_PLAN_CAP = 5;
 export const HARD_TIMEOUT_MS = 90_000;
-export const MOLD_SIZE = 3; // Injection mold: clauses per batch enrichment call
+export const MOLD_SIZE = 8; // Injection mold: clauses per batch enrichment call
 
 export const JSON_HEADERS = { "Content-Type": "application/json" };
 export function jsonResponse(body: unknown, status = 200): Response {

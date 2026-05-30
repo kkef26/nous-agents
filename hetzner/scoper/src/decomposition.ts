@@ -521,11 +521,24 @@ async function callBatchEnrichLLM(
       previouslyEnriched.map((p) => `- ${p.id}: "${p.title}"`).join("\n");
   }
 
-  const userMessage = sourceContext +
-    `\n\n## Full Clause Skeleton (all stubs for reference)\n${allStubSection}` +
+  // Lean context: stubs carry the grill intent from skeleton phase.
+  // No need to resend full grill decisions + architecture for enrichment.
+  const userMessage = `## Feature Context
+- Feature ID: ${featureId}
+- Project: ${project}
+
+## Full Clause Skeleton (all stubs for reference)
+${allStubSection}` +
     prevSection +
-    `\n\n## Clause Stubs to Enrich NOW (batch ${batchIndex + 1}/${batchTotal})\n${stubSection}` +
-    `\n\n## Instructions\nGenerate FULL clauses with bodies, ACs, and contracts for ONLY the ${batchStubs.length} stubs listed in "Clause Stubs to Enrich NOW".\nDo NOT generate clauses for stubs not in this batch.\nUse the EXACT clause IDs from the stubs.`;
+    `\n\n## Clause Stubs to Enrich NOW (batch ${batchIndex + 1}/${batchTotal})
+${stubSection}
+
+## Instructions
+Generate FULL clauses with bodies, ACs, and contracts for ONLY the ${batchStubs.length} stubs listed above.
+Do NOT generate clauses for stubs not in this batch.
+Use the EXACT clause IDs from the stubs.
+Each clause body must have: ## Why, ## What, ## How, ## Files.
+2-8 ACs per clause with concrete verification commands.`;
 
   await emitPipelineEvent({
     feature_id: featureId,
