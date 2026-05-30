@@ -770,7 +770,7 @@ async function callGenerateLLM(userMessage: string): Promise<{
       headers: { "Content-Type": "application/json", "x-api-key": proxyKey },
       body: JSON.stringify({
         model: "opus",
-        max_tokens: 16384,
+        max_tokens: 8192,
         system: GENERATE_SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
       }),
