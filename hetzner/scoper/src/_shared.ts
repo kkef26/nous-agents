@@ -8,8 +8,9 @@ export const SCOPER_VERSION = "scoper-v0.1.0";
 export const DEDUP_WINDOW_SECONDS = 30;
 export const HOURLY_PLAN_CAP = 5;
 export const HARD_TIMEOUT_MS = 90_000;
-export const JSON_HEADERS = { "Content-Type": "application/json" };
+export const MOLD_SIZE = 3; // Injection mold: clauses per batch enrichment call
 
+export const JSON_HEADERS = { "Content-Type": "application/json" };
 export function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
@@ -19,10 +20,10 @@ export interface DispatchTreeRow {
   project: string;
   scoper_run_id: string | null;
   prior_plan_id?: string | null;
-  clauses: unknown;          // jsonb array of clause specs
-  waves: unknown;            // jsonb array of wave specs
+  clauses: unknown;        // jsonb array of clause specs
+  waves: unknown;          // jsonb array of wave specs
   customer_experience: string | null;
-  preconditions: unknown;    // jsonb array of strings
+  preconditions: unknown;  // jsonb array of strings
   outcome_mode: "A" | "B" | "C";
   delta_from_prior?: unknown;
 }
@@ -49,6 +50,38 @@ export async function insertDispatchTree(row: DispatchTreeRow): Promise<string |
     throw new Error(`scoper.insertDispatchTree: ${error.message}`);
   }
   return data ? (data as { id: string }).id : null;
+}
+
+/**
+ * Emit a pipeline event to nous.pipeline_events for carwash visibility.
+ * Fire-and-forget: never throws, never blocks the pipeline.
+ * Events are observability, not control flow.
+ */
+export async function emitPipelineEvent(event: {
+  feature_id: string;
+  project: string;
+  event_type: string;
+  agent: string;
+  clause_id?: string;
+  detail_jsonb?: Record<string, unknown>;
+  severity?: "info" | "warn" | "error";
+}): Promise<void> {
+  try {
+    const sb = getSupabaseClient();
+    // deno-lint-ignore no-explicit-any
+    await (sb as any).from("pipeline_events").insert({
+      feature_id: event.feature_id,
+      project: event.project,
+      event_type: event.event_type,
+      agent: event.agent,
+      clause_id: event.clause_id ?? null,
+      detail_jsonb: event.detail_jsonb ?? {},
+      severity: event.severity ?? "info",
+    });
+  } catch (e) {
+    console.error(`[pipeline_event] emission failed (${event.event_type}):`, (e as Error).message);
+    // Never throw — events are advisory
+  }
 }
 
 /**
