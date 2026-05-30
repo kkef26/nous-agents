@@ -468,7 +468,7 @@ async function callSkeletonLLM(
     userMessage,
     model: "opus",
     max_tokens: 8192,
-    timeout_ms: 120_000,
+    timeout_ms: 300_000,  // opus needs 5min for large features
   });
 
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
