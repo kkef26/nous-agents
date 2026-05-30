@@ -696,28 +696,39 @@ async function generateClausesFromSource(
 
   for (let bi = 0; bi < batches.length; bi++) {
     const batch = batches[bi];
-    const result = await callBatchEnrichLLM(
-      sourceContext,
-      batch,
-      skeleton.stubs,
-      previouslyEnriched,
-      bi,
-      batches.length,
-      featureId,
-      projectTag,
-    );
+    try {
+      const result = await callBatchEnrichLLM(
+        sourceContext,
+        batch,
+        skeleton.stubs,
+        previouslyEnriched,
+        bi,
+        batches.length,
+        featureId,
+        projectTag,
+      );
 
-    totalTokensIn += result.tokens_in;
-    totalTokensOut += result.tokens_out;
-    totalCost += result.cost_usd;
+      totalTokensIn += result.tokens_in;
+      totalTokensOut += result.tokens_out;
+      totalCost += result.cost_usd;
 
-    for (const gc of result.clauses) {
-      const clause = validateClause(gc, prefix);
-      if (clause) {
-        clause.feature_id = featureId;
-        allClauses.push(clause);
-        previouslyEnriched.push({ id: clause.id, title: clause.title });
+      for (const gc of result.clauses) {
+        const clause = validateClause(gc, prefix);
+        if (clause) {
+          clause.feature_id = featureId;
+          allClauses.push(clause);
+          previouslyEnriched.push({ id: clause.id, title: clause.title });
+        }
       }
+    } catch (batchErr) {
+      // Non-fatal: log error, skip this batch, continue with remaining
+      console.error(`[scoper] batch ${bi} failed (non-fatal, continuing): ${(batchErr as Error).message}`);
+      await emitPipelineEvent({
+        feature_id: featureId, project: projectTag,
+        event_type: "scoper.batch.error", agent: "scoper", severity: "error",
+        detail_jsonb: { batch_index: bi, error: (batchErr as Error).message, clause_titles: batch.map(s => s.title) },
+      });
+      // Continue — don't lose clauses from previous successful batches
     }
   }
 
