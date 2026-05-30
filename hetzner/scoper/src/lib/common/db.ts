@@ -5,9 +5,14 @@
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-// Node 20 lacks native WebSocket — provide ws as transport for supabase-js realtime.
-// @ts-ignore — ws has no bundled types, runtime-only import for Node 20 WebSocket compat
-const ws = require("ws");
+// Node 20 lacks native WebSocket — polyfill globally so supabase-js doesn't throw.
+// Scoper/Conductor don't use realtime subscriptions, but supabase-js checks for
+// WebSocket availability at client creation time.
+// @ts-ignore
+if (typeof globalThis.WebSocket === "undefined") {
+  // @ts-ignore
+  globalThis.WebSocket = require("ws");
+}
 
 // Untyped client — many tables touched (features, dispatch_queue, agent_events, …)
 // are not enumerated in NousDatabase, so callers already cast to any. Keeping the
@@ -42,7 +47,6 @@ export function getSupabaseClient(): NousSupabaseClient {
     global: {
       headers: { "x-client-info": "nous-agents/_common/db.ts" },
     },
-    realtime: { transport: ws },
   }) as unknown as NousSupabaseClient;
   cached = client;
   return client;
