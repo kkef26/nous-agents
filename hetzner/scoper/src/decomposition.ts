@@ -246,7 +246,12 @@ Rules:
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function stripJsonFences(text: string): string {
-  return text.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?```\s*$/i, "").trim();
+  let t = text.trim();
+  // Strip leading ```json or ``` (with optional whitespace/newlines before)
+  t = t.replace(/^\s*```(?:json|JSON)?\s*\n?/i, "");
+  // Strip trailing ``` (with optional whitespace/newlines after)
+  t = t.replace(/\n?\s*```\s*$/i, "");
+  return t.trim();
 }
 
 async function sha256HexAsync(text: string): Promise<string> {
@@ -770,7 +775,7 @@ async function callGenerateLLM(userMessage: string): Promise<{
       headers: { "Content-Type": "application/json", "x-api-key": proxyKey },
       body: JSON.stringify({
         model: "opus",
-        max_tokens: 8192,
+        max_tokens: 16384,
         system: GENERATE_SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
       }),
