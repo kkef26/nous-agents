@@ -163,7 +163,10 @@ Rules:
 - critical_path = true if delay blocks the entire feature
 - brief must be specific enough to guide full clause generation later
 - Every grill decision must be traceable to at least one clause stub
-- Right-size: each clause = 1 worker session = 1 PR (~30-60 min for a senior dev)`;
+- Right-size: each clause = 1 worker session = 1 PR (~30-60 min for a senior dev)
+- customer_experience: MAX 2 sentences. No architecture details.
+- brief: MAX 2 sentences per stub. Just what it builds and why — no implementation details.
+- Keep total output under 4000 tokens. This is a skeleton, not a spec.`;
 
 const GENERATE_SYSTEM_PROMPT = `You are Scoper, the autonomous planning engine for the NOUS factory pipeline.
 You are in BATCH ENRICHMENT MODE: you receive clause STUBS (IDs, titles, briefs) and must produce FULL clauses with bodies, ACs, and contracts.
@@ -467,7 +470,7 @@ async function callSkeletonLLM(
     system: SKELETON_SYSTEM_PROMPT,
     userMessage,
     model: "opus",
-    max_tokens: 8192,
+    max_tokens: 16384,
     timeout_ms: 300_000,  // opus needs 5min for large features
   });
 
