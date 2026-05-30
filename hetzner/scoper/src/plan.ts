@@ -467,28 +467,77 @@ export async function runPlan(
 
   const dispatchTreeId = await insertDispatchTree(dispatchTreeRow);
 
-  // ─── GAP 2 fix: Promote clauses + write ACs + trigger dispatch ────────────
+  // ─── GAP 2 fix + Generate mode: Persist + Promote + Dispatch ──────────────
   // Per grill decision 63b43107: Scoper flips both gates atomically at Mode A end.
+  // Per grill decision D4: Generate mode INSERTs new clauses before promotion.
   const clauseIdsToPromote = decomposition.clauses.map((c) => c.id);
 
   if (clauseIdsToPromote.length > 0) {
     const sb = getSupabaseClient();
 
-    // 1. Write ACs + contract back to bible_clauses (LLM-enriched or generated)
-    for (const clause of decomposition.clauses) {
-      const updatePayload: Record<string, unknown> = {
-        acceptance_criteria: clause.acceptance_criteria,
-        updated_at: new Date().toISOString(),
-      };
-      // Only overwrite contract if LLM actually produced one
-      if (clause.contract) {
-        updatePayload.contract = clause.contract;
+    if (decomposition.generated) {
+      // ─── Generate mode: INSERT new clauses into bible_clauses ───────────
+      for (const clause of decomposition.clauses) {
+        const insertPayload = {
+          id: clause.id,
+          prefix: clause.prefix,
+          parent_id: clause.parent_id,
+          feature_id: clause.feature_id,
+          sequence_order: clause.sequence_order,
+          maturity_stage: "SCAFFOLD",
+          status: "draft",
+          clause_type: clause.clause_type,
+          critical_path: clause.critical_path,
+          requires: clause.requires,
+          enables: clause.enables,
+          acceptance_criteria: clause.acceptance_criteria,
+          body: clause.body,
+          contract: clause.contract ?? null,
+          frontmatter: { title: clause.title },
+          approved_for_dispatch: false,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+
+        // deno-lint-ignore no-explicit-any
+        const { error: insertErr } = await (sb as any)
+          .from("bible_clauses")
+          .upsert(insertPayload, { onConflict: "id" });
+
+        if (insertErr) {
+          console.error(`[scoper] failed to insert generated clause ${clause.id}: ${insertErr.message}`);
+          await emitScoperSignal("scoper_generate_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
+            `Failed to insert clause ${clause.id}: ${insertErr.message}`, { clause_id: clause.id });
+        }
       }
+
+      // Update features.clauses array with the new clause IDs
       // deno-lint-ignore no-explicit-any
       await (sb as any)
-        .from("bible_clauses")
-        .update(updatePayload)
-        .eq("id", clause.id);
+        .from("features")
+        .update({
+          clauses: clauseIdsToPromote,
+          lifecycle_stage: "SCAFFOLD",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", feature.id);
+
+    } else {
+      // ─── Enrich mode: UPDATE existing clauses with ACs + contracts ──────
+      for (const clause of decomposition.clauses) {
+        const updatePayload: Record<string, unknown> = {
+          acceptance_criteria: clause.acceptance_criteria,
+          updated_at: new Date().toISOString(),
+        };
+        if (clause.contract) {
+          updatePayload.contract = clause.contract;
+        }
+        // deno-lint-ignore no-explicit-any
+        await (sb as any)
+          .from("bible_clauses")
+          .update(updatePayload)
+          .eq("id", clause.id);
+      }
     }
 
     // 2. Promote: status='active', approved_for_dispatch=true, maturity_stage='SCAFFOLD'
@@ -504,13 +553,11 @@ export async function runPlan(
       .in("id", clauseIdsToPromote);
 
     if (promoteErr) {
-      // Non-fatal: log but continue — dispatch_tree is already written
       await emitScoperSignal("scoper_promote_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
         `Promotion failed: ${promoteErr.message}`, { clause_ids: clauseIdsToPromote, error: promoteErr.message });
     }
 
     // 3. Call POST /dispatch/tree to trigger workers
-    // Use the NOUS edge function directly (same Supabase instance)
     try {
       const nousUrl = process.env.SUPABASE_URL ?? "https://oozlawunlkkuaykfunan.supabase.co";
       const nousKey = process.env.NOUS_API_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
@@ -533,8 +580,6 @@ export async function runPlan(
           `Dispatch call failed: ${dispatchResp.status}`, { response: dispatchResult.slice(0, 300) });
       }
     } catch (err) {
-      // Non-fatal: clauses are promoted, dispatch_tree row exists.
-      // Manual dispatch can recover.
       await emitScoperSignal("scoper_dispatch_error", project.tag, audit.triggered_by_agent_id, audit.session_id,
         `Dispatch call error: ${(err as Error).message}`, { feature_id: feature.id });
     }
