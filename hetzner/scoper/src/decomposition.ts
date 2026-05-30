@@ -471,7 +471,7 @@ async function callSkeletonLLM(
     userMessage,
     model: "sonnet",
     max_tokens: 16384,
-    timeout_ms: 180_000,  // sonnet is 3-5x faster than opus  // opus needs 5min for large features
+    timeout_ms: 300_000,  // opus needs 5min for large features
   });
 
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
@@ -558,7 +558,7 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
     userMessage,
     model: "sonnet",
     max_tokens: 16384,
-    timeout_ms: 180_000,  // sonnet is 3-5x faster than opus
+    timeout_ms: 300_000,
   });
 
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
