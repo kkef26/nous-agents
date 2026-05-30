@@ -766,7 +766,7 @@ async function callGenerateLLM(userMessage: string): Promise<{
   const proxyUrl = process.env.STATION_PROXY_URL ?? "http://127.0.0.1:8095";
   const proxyKey = process.env.STATION_PROXY_KEY ?? process.env.NOUS_API_KEY ?? "";
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 180_000);
+  const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min — opus with 16K tokens
 
   let response: Response;
   try {
