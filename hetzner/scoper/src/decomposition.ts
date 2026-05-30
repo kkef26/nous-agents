@@ -408,7 +408,8 @@ async function callEnrichmentLLM(userMessage: string): Promise<{
   tokens_out: number;
   cost_usd: number;
 }> {
-  const proxyUrl = process.env.STATION_PROXY_URL ?? "http://5.161.190.85:8095";
+  const proxyUrl = process.env.STATION_PROXY_URL ?? "http://127.0.0.1:8095";
+  const proxyKey = process.env.STATION_PROXY_KEY ?? process.env.NOUS_API_KEY ?? "";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 130_000);
 
