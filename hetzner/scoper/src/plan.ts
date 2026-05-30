@@ -29,6 +29,7 @@ import { runPrerequisiteChecks } from "./prerequisites.js";
 import type { FeatureRow, ProjectRow } from "./prerequisites.js";
 import { decomposeFeature } from "./decomposition.js";
 import { organizeWaves } from "./waves.js";
+import { runAlignmentGate } from "./alignment_gate.js";
 import {
   DEDUP_WINDOW_SECONDS,
   HOURLY_PLAN_CAP,
@@ -326,6 +327,77 @@ export async function runPlan(
     },
     audit, step2Id, Date.now(),
   );
+
+  // ─── Step 3b: Alignment gate (generate mode only — D5) ─────────────────────
+  // Cold-read generated clauses against source material via haiku.
+  // Pass → continue to Step 4. Flag → Mode B (one revision loop).
+
+  if (decomposition.generated && decomposition.clauses.length > 0) {
+    const alignStart = Date.now();
+    try {
+      const alignResult = await runAlignmentGate(
+        feature.id, feature.name, feature.description,
+        decomposition.clauses, project.tag,
+      );
+
+      await logStep(
+        feature, project.tag, mode, 3, "alignment_gate",
+        { clause_count: decomposition.clauses.length, generated: true },
+        {
+          passed: alignResult.passed,
+          flagged_clauses: alignResult.flagged,
+          reasoning: alignResult.reasoning?.slice(0, 500),
+          tokens_in: alignResult.tokens_in,
+          tokens_out: alignResult.tokens_out,
+        },
+        audit, step2Id, alignStart,
+        {
+          model_used: "claude-haiku-4-5-20251001",
+          tokens_in: alignResult.tokens_in,
+          tokens_out: alignResult.tokens_out,
+          estimated_cost_usd: alignResult.cost_usd,
+        },
+      );
+
+      if (!alignResult.passed) {
+        // Mode B: alignment gate flagged issues
+        const findings = {
+          mode_b_reason: "alignment_gate_failure",
+          flagged_clauses: alignResult.flagged,
+          reasoning: alignResult.reasoning,
+          scoped_at: new Date().toISOString(),
+        };
+        await writeScoperFindings(feature.id, findings, mode);
+        await emitScoperSignal("scoper_held", project.tag, audit.triggered_by_agent_id, audit.session_id,
+          `Mode B: alignment gate flagged ${alignResult.flagged.length} clause(s)`,
+          { feature_id: feature.id, flagged: alignResult.flagged.map((f) => f.clause_id) });
+        const runId = await logStep(
+          feature, project.tag, mode, 6, "emit_mode_b",
+          { reason: "alignment_gate_failure" },
+          { outcome_mode: "B", signal: "scoper_held", flagged_count: alignResult.flagged.length },
+          audit, step2Id, Date.now(),
+        );
+        const resp: PlanResponse = {
+          outcome_mode: "B",
+          feature_id: feature.id,
+          scoper_run_id: runId,
+          dispatch_tree_id: null,
+          scoper_findings: findings,
+          signal: "scoper_held",
+        };
+        return jsonResponse(resp, 200);
+      }
+    } catch (alignErr) {
+      // Non-fatal: log and continue — alignment gate is advisory, not blocking
+      console.error(`[scoper] alignment gate error (continuing): ${(alignErr as Error).message}`);
+      await logStep(
+        feature, project.tag, mode, 3, "alignment_gate_error",
+        { error: (alignErr as Error).message },
+        { passed: true, reason: "gate_error_passthrough" },
+        audit, step2Id, alignStart,
+      );
+    }
+  }
 
   // ─── Step 4: 7-point prerequisite check ────────────────────────────────────
 
