@@ -470,7 +470,7 @@ async function callSkeletonLLM(
     system: SKELETON_SYSTEM_PROMPT,
     userMessage,
     model: "sonnet",
-    max_tokens: 16384,
+    max_tokens: 32768,
     timeout_ms: 300_000,  // opus needs 5min for large features
   });
 
@@ -557,7 +557,7 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
     system: GENERATE_SYSTEM_PROMPT,
     userMessage,
     model: "sonnet",
-    max_tokens: 16384,
+    max_tokens: 32768,
     timeout_ms: 300_000,
   });
 
