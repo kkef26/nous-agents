@@ -107,6 +107,8 @@ export async function handleDeploy(req: Request): Promise<Response> {
   }
 
   // Step 2: Git fetch + checkout
+  // Ensure safe.directory is set (ownership may differ between users)
+  run(`git config --global --add safe.directory ${REPO_ROOT}`, REPO_ROOT);
   const t1 = Date.now();
   const gitFetch = run(`git fetch origin ${branch}`, REPO_ROOT);
   const gitCheckout = run(`git checkout origin/${branch} -- hetzner/${service}/`, REPO_ROOT);
