@@ -175,12 +175,9 @@ You are in BATCH ENRICHMENT MODE: you receive clause STUBS (IDs, titles, briefs)
 Each clause is a work unit that a single AI worker (Claude Code agent) will build in one session (~30-60 min). Think of a clause as one PR's worth of work.
 
 ## Output Format
-Output as YAML multi-document. Each clause is a separate YAML document separated by ---
-The FIRST document is metadata with customer_experience. Subsequent documents are individual clauses.
-Use YAML block scalars (|) for multi-line text fields like body.
-Do NOT wrap in markdown fences. Do NOT output JSON.
-
-Example:
+Output as YAML multi-document. Each clause is a separate YAML document separated by ---.
+The FIRST document has only customer_experience. Each subsequent document is one clause.
+Use YAML block scalars (|) for the body field. Do NOT output JSON. Do NOT wrap in fences.
 
 customer_experience: "When this feature ships, the user..."
 ---
@@ -193,14 +190,11 @@ enables: [PREFIX.2]
 sequence_order: 1
 body: |
   ## Why
-  Reason this clause exists.
-
+  ...
   ## What
-  What gets built.
-
+  ...
   ## How
-  Implementation approach.
-
+  ...
   ## Files
   - path/to/file.ts
 acceptance_criteria:
@@ -224,20 +218,15 @@ contract:
     - target: AC01
       method: curl
       command: "curl -s http://localhost:3000/example"
-      expect: "200 OK with JSON body"
----
-id: PREFIX.2
-title: Next clause
-...
+      expect: "200 OK"
 
 ## Rules
 - Use the EXACT clause IDs from the stubs. Do NOT add, remove, or renumber.
-- Each clause body MUST have: ## Why, ## What, ## How, ## Files — use YAML block scalar (|).
+- Each clause body MUST have: ## Why, ## What, ## How, ## Files
 - 2-8 ACs per clause. "auto" ACs must include concrete verification commands.
 - BANNED: "works correctly", "no regressions", "ships when pushed"
 - Every grill decision must be reflected in at least one clause body, AC, or antipattern.
-- Deferred items go in contract.exclusions.
-- NEVER use JSON. Output YAML only.`;
+- Deferred items go in contract.exclusions.`;
 
 const ENRICHMENT_SYSTEM_PROMPT = `You are Scoper, the autonomous planning engine for the NOUS factory pipeline.
 You are in ENRICH MODE: clauses already exist with bodies written by a human planner.
@@ -619,26 +608,18 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
   let parsed: GenerateLLMOutput;
   try {
-    // YAML multi-document parse — truncation-resilient
+    // YAML multi-document parse with JSON fallback
     const yamlDocs: unknown[] = [];
-    yaml.loadAll(text.replace(/^\s*```(?:ya?ml)?\s*\n?/i, "").replace(/\n?\s*```\s*$/i, ""), (doc: unknown) => { if (doc) yamlDocs.push(doc); });
-    // First doc is metadata (customer_experience), rest are clauses
-    const yamlMeta = (yamlDocs[0] && typeof yamlDocs[0] === "object" && "customer_experience" in (yamlDocs[0] as Record<string, unknown>)) ? yamlDocs.shift() as Record<string, unknown> : null;
-    parsed = {
-      customer_experience: (yamlMeta?.customer_experience as string) ?? "",
-      clauses: yamlDocs as GenerateLLMOutput["clauses"],
-
-    // Fallback: if YAML parse yielded 0 clauses, the LLM may have returned JSON
-    if ((!parsed.clauses || parsed.clauses.length === 0) && text.includes('"clauses"')) {
-      try {
-        const jsonFallback = JSON.parse(text);
-        if (jsonFallback.clauses && jsonFallback.clauses.length > 0) {
-          parsed = jsonFallback as GenerateLLMOutput;
-          console.warn(`[scoper] YAML parse yielded 0 clauses, JSON fallback found ${parsed.clauses.length}`);
-        }
-      } catch { /* JSON fallback also failed — stay with YAML result */ }
+    yaml.loadAll(text.replace(/^\s*\`\`\`[\w]*\s*\n?/, "").replace(/\n?\s*\`\`\`\s*$/, ""), (doc: unknown) => { if (doc) yamlDocs.push(doc); });
+    const meta = (yamlDocs[0] && typeof yamlDocs[0] === "object" && "customer_experience" in (yamlDocs[0] as Record<string, unknown>))
+      ? yamlDocs.shift() as Record<string, unknown> : null;
+    const yamlClauses = yamlDocs.filter(d => d && typeof d === "object" && "id" in (d as Record<string, unknown>));
+    if (yamlClauses.length > 0) {
+      parsed = { customer_experience: (meta?.customer_experience as string) ?? "", clauses: yamlClauses as GenerateLLMOutput["clauses"] } as GenerateLLMOutput;
+    } else {
+      // Fallback: LLM may have returned JSON despite YAML prompt
+      parsed = JSON.parse(text);
     }
-    } as GenerateLLMOutput;
   } catch (err) {
     await emitPipelineEvent({
       feature_id: featureId,
@@ -652,7 +633,7 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
         clause_titles: batchStubs.map((s) => s.title),
       },
     });
-    throw new Error(`Batch ${batchIndex + 1} YAML parse failed: ${(err as Error).message}: ${text.slice(0, 300)}`);
+    throw new Error(`Batch ${batchIndex + 1} JSON parse failed: ${(err as Error).message}: ${text.slice(0, 300)}`);
   }
 
   await emitPipelineEvent({
