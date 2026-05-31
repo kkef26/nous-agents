@@ -129,7 +129,8 @@ export async function handleDeploy(req: Request): Promise<Response> {
   // Step 3: npm install
   const svcDir = `${HETZNER_DIR}/${service}`;
   const t2 = Date.now();
-  const npmResult = run("npm install --no-audit --no-fund", svcDir, 120);
+  // NODE_ENV=production (from PM2) skips devDependencies — force include for tsc
+  const npmResult = run("NODE_ENV=development npm install --no-audit --no-fund", svcDir, 120);
   steps.push({
     step: "npm_install",
     ok: npmResult.ok,
