@@ -34,6 +34,7 @@ import { compareCommits, getFileContent } from "./lib/common/github.js";
 import { writeStep, finalizeStep } from "./lib/common/logging.js";
 import { getSupabaseClient } from "./lib/common/db.js";
 import { scoreWith5Axis } from "./sentinel.js";
+import { handleMerge } from "./merge.js";
 import { createFuse } from "./fuse_manager.js";
 import type {
   AuditTrail,
@@ -829,5 +830,38 @@ export async function handleVerify(req: Request): Promise<Response> {
     conductor_log_id: run_id,
     override_reason,
   };
+
+  // ── Auto-merge chain: pass/pass_with_amendments → trigger merge ──────────
+  // Fire-and-forget: don't block verify response on merge outcome.
+  // Merge has its own veto gate (Step 4: all clauses in diff must have pass verdict)
+  // so this is safe to fire eagerly — merge will refuse if conditions aren't met.
+  if (verdict === "pass" || verdict === "pass_with_amendments") {
+    const mergeBody = {
+      project: clause.project,
+      locked_by: `conductor-auto-merge:${run_id}`,
+      triggered_by_agent_id: "conductor-verify",
+      session_id: audit.session_id,
+    };
+    // Don't await — let merge run independently
+    (async () => {
+      try {
+        const mergeReq = new Request("http://localhost/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(mergeBody),
+        });
+        const mergeResp = await handleMerge(mergeReq);
+        const mergeData = await mergeResp.json();
+        console.log(
+          `[verify→merge] auto-merge for ${clause.project}: ` +
+          `merged=${mergeData.merged ?? false}, reason=${mergeData.reason ?? mergeData.error ?? "ok"}`,
+        );
+      } catch (mergeErr: unknown) {
+        const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
+        console.error(`[verify→merge] auto-merge failed for ${clause.project}: ${msg}`);
+      }
+    })();
+  }
+
   return jsonResponse(response, 200);
 }
