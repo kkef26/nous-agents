@@ -819,6 +819,112 @@ export async function handleVerify(req: Request): Promise<Response> {
     console.error(`[verify] conductor_log column patch failed: ${patchErr.message}`);
   }
 
+  // ── Step 8 — failure recovery: redispatch or escalate ─────────────────────
+  // Closes the loop: fail_tactical gets a retry with sentinel feedback,
+  // fail_strategic/hold_for_review gets surfaced to Kosta via decision_queue.
+  let recoveryResult: Record<string, unknown> | null = null;
+  if (verdict === "fail_tactical") {
+    // Auto-redispatch: fire a new dispatch with sentinel feedback baked in.
+    // Cap at 3 attempts per clause to prevent infinite loops.
+    if (attempt_count < 3) {
+      try {
+        const feedbackLines = [
+          `## Sentinel Feedback (attempt ${attempt_count}, score ${sentinel.score}/100)`,
+          ...(sentinel.amendments_suggested || []).map((a: string) => `- ${a}`),
+          ...(sentinel.notes ? [`\nNotes: ${sentinel.notes}`] : []),
+          ...ac_results.filter(a => a.result === "fail").map(a => `- FAILED AC: ${a.text} — ${a.detail || "no detail"}`),
+        ].join("\n");
+
+        const { data: redispatch, error: rdErr } = await sb
+          .from("dispatch_queue")
+          .insert({
+            clause_id: parsed.clause_id,
+            project: clause.project,
+            bible_clause: parsed.clause_id,
+            status: "pending",
+            priority: 2,
+            context: {
+              retry_of: parsed.dispatch_id,
+              attempt: attempt_count + 1,
+              sentinel_feedback: feedbackLines,
+              prior_score: sentinel.score,
+              prior_verdict: verdict,
+            },
+          })
+          .select("id")
+          .single();
+        if (rdErr) {
+          console.error(`[verify→redispatch] insert failed: ${rdErr.message}`);
+          recoveryResult = { action: "redispatch_failed", error: rdErr.message };
+        } else {
+          console.log(`[verify→redispatch] ${parsed.clause_id} attempt ${attempt_count + 1} queued as ${redispatch.id}`);
+          recoveryResult = { action: "redispatch", new_dispatch_id: redispatch.id, attempt: attempt_count + 1 };
+        }
+      } catch (rdErr: unknown) {
+        const msg = rdErr instanceof Error ? rdErr.message : String(rdErr);
+        recoveryResult = { action: "redispatch_failed", error: msg };
+      }
+    } else {
+      // Max retries exceeded → escalate to decision_queue
+      try {
+        await sb.from("decision_queue").insert({
+          question: `Clause ${parsed.clause_id} failed tactical verification ${attempt_count} times (best score: ${sentinel.score}/100). Options: redispatch with new approach, rewrite clause scope, or kill.`,
+          context: {
+            clause_id: parsed.clause_id,
+            dispatch_id: parsed.dispatch_id,
+            attempts: attempt_count,
+            last_score: sentinel.score,
+            per_axis: sentinel.per_axis,
+            sentinel_notes: sentinel.notes,
+            amendments: sentinel.amendments_suggested,
+            options: ["redispatch_with_new_approach", "rewrite_clause_scope", "kill_clause"],
+          },
+          bible_clause: parsed.clause_id,
+          agent_id: "conductor-verify",
+          project: clause.project,
+          urgency: "high",
+        });
+        recoveryResult = { action: "escalated_max_retries", attempts: attempt_count };
+      } catch (escErr: unknown) {
+        recoveryResult = { action: "escalate_failed", error: (escErr as Error).message };
+      }
+    }
+  } else if (verdict === "fail_strategic" || verdict === "hold_for_review") {
+    // Immediate escalation — this code is fundamentally broken or blocked.
+    try {
+      const urgency = verdict === "hold_for_review" ? "compile failure" : "strategic failure";
+      await sb.from("decision_queue").insert({
+        question: `Clause ${parsed.clause_id} received ${urgency} verdict (score: ${sentinel.score}/100). Review required — redispatch differently, manual fix, or kill.`,
+        context: {
+          clause_id: parsed.clause_id,
+          dispatch_id: parsed.dispatch_id,
+          verdict,
+          score: sentinel.score,
+          per_axis: sentinel.per_axis,
+          sentinel_notes: sentinel.notes,
+          ac_failures: ac_results.filter(a => a.result === "fail").map(a => ({ id: a.id, text: a.text, detail: a.detail })),
+          options: ["redispatch_different_approach", "manual_fix", "kill_clause", "ignore"],
+        },
+        bible_clause: parsed.clause_id,
+        agent_id: "conductor-verify",
+        project: clause.project,
+        urgency: verdict === "hold_for_review" ? "blocking" : "high",
+      });
+      recoveryResult = { action: "escalated", verdict };
+    } catch (escErr: unknown) {
+      recoveryResult = { action: "escalate_failed", error: (escErr as Error).message };
+    }
+  }
+
+  // ── Step 9 — update dispatch_queue status so batch/verify skips this one ──
+  try {
+    const newStatus = (verdict === "pass" || verdict === "pass_with_amendments") ? "verified" : "verification_failed";
+    await sb.from("dispatch_queue").update({
+      status: newStatus,
+      result: JSON.stringify({ verdict, score: sentinel.score, run_id }),
+    }).eq("id", parsed.dispatch_id);
+  } catch (_) { /* best-effort */ }
+
   const response: VerifyResponse = {
     verdict,
     score: sentinel.score,
@@ -829,7 +935,8 @@ export async function handleVerify(req: Request): Promise<Response> {
     run_id,
     conductor_log_id: run_id,
     override_reason,
-  };
+    recovery: recoveryResult,
+  } as VerifyResponse & { recovery: unknown };
 
   // ── Auto-merge chain: pass/pass_with_amendments → trigger merge ──────────
   // Fire-and-forget: don't block verify response on merge outcome.
