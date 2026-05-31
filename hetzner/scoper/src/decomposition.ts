@@ -628,60 +628,56 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
   });
 
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
-  let parsed: GenerateLLMOutput;
+  let parsed: GenerateLLMOutput = { customer_experience: "", clauses: [] };
   try {
     // Markdown+frontmatter parser: split on ===CLAUSE===, parse each block
     const cleaned = text.replace(/^\s*```[\w]*\s*\n?/i, "").replace(/\n?\s*```\s*$/i, "").trim();
-    const blocks = cleaned.split(/\n*===CLAUSE===\n*/);
-    let customerExperience = "";
-    const clauses: GenerateLLMOutput["clauses"] = [];
 
-    for (const block of blocks) {
-      const trimmed = block.trim();
-      if (!trimmed) continue;
+    // JSON fallback: if entire output is JSON, parse directly
+    if (cleaned.startsWith("{")) {
+      parsed = JSON.parse(cleaned);
+    } else {
+      const blocks = cleaned.split(/\n*===CLAUSE===\n*/);
+      let customerExperience = "";
+      const clauses: GenerateLLMOutput["clauses"] = [];
 
-      // Extract frontmatter between --- delimiters
-      const fmMatch = trimmed.match(/^---\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
-      if (!fmMatch) {
-        // Try JSON fallback for entire output
-        if (trimmed.startsWith("{")) {
-          parsed = JSON.parse(cleaned);
-          break;
+      for (const block of blocks) {
+        const trimmed = block.trim();
+        if (!trimmed) continue;
+
+        // Extract frontmatter between --- delimiters
+        const fmMatch = trimmed.match(/^---\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+        if (!fmMatch) continue;
+
+        const frontmatterText = fmMatch[1];
+        const bodyText = (fmMatch[2] || "").trim();
+
+        // Parse frontmatter YAML (short, structured — safe for yaml.load)
+        let fm: Record<string, unknown>;
+        try {
+          fm = yaml.load(frontmatterText) as Record<string, unknown>;
+        } catch (yamlErr) {
+          console.warn(`[scoper] frontmatter parse failed, skipping block: ${(yamlErr as Error).message}`);
+          continue;
         }
-        continue;
+
+        if (!fm || typeof fm !== "object") continue;
+
+        // Metadata block: customer_experience only
+        if ("customer_experience" in fm && !("id" in fm)) {
+          customerExperience = fm.customer_experience as string;
+          continue;
+        }
+
+        // Clause block: structured frontmatter + markdown body
+        if ("id" in fm) {
+          clauses.push({
+            ...fm,
+            body: bodyText || (fm.body as string) || "",
+          } as GenerateLLMOutput["clauses"][0]);
+        }
       }
 
-      const frontmatterText = fmMatch[1];
-      const bodyText = (fmMatch[2] || "").trim();
-
-      // Parse frontmatter YAML (short, structured — safe for yaml.load)
-      let fm: Record<string, unknown>;
-      try {
-        fm = yaml.load(frontmatterText) as Record<string, unknown>;
-      } catch (yamlErr) {
-        console.warn(`[scoper] frontmatter YAML parse failed for block, skipping: ${(yamlErr as Error).message}`);
-        continue;
-      }
-
-      if (!fm || typeof fm !== "object") continue;
-
-      // First block: metadata with customer_experience
-      if ("customer_experience" in fm && !("id" in fm)) {
-        customerExperience = fm.customer_experience as string;
-        continue;
-      }
-
-      // Clause block: frontmatter has structured fields, body is markdown
-      if ("id" in fm) {
-        clauses.push({
-          ...fm,
-          body: bodyText || (fm.body as string) || "",
-        } as GenerateLLMOutput["clauses"][0]);
-      }
-    }
-
-    // If we didn't break out to JSON fallback above
-    if (!parsed!) {
       parsed = { customer_experience: customerExperience, clauses };
     }
   } catch (err) {
