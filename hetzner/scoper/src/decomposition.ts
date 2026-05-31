@@ -468,21 +468,31 @@ function buildSourceContext(
   return parts.join("\n");
 }
 
-async function loadShippedClauses(projectTag: string): Promise<Array<{ id: string; title: string }>> {
+interface ShippedClause {
+  id: string;
+  title: string;
+  summary: string; // first ~300 chars of body — enough for LLM to judge overlap
+}
+
+async function loadShippedClauses(projectTag: string, clausePrefix: string): Promise<ShippedClause[]> {
   const sb = getSupabaseClient();
+  // Extract the project prefix (e.g. "NST" from "NST.feat.1") for filtering
+  const projPrefix = clausePrefix.split(".")[0];
   // deno-lint-ignore no-explicit-any
   const { data, error } = await (sb as any)
     .from("bible_clauses")
-    .select("id, frontmatter")
-    .or(`status.eq.shipped,maturity_stage.eq.SHIPPED`)
+    .select("id, frontmatter, body")
+    .eq("prefix", projPrefix)
+    .or(`status.eq.shipped,status.eq.build_complete,maturity_stage.eq.SHIPPED`)
     .order("id", { ascending: true });
   if (error) {
     console.error(`[scoper] loadShippedClauses failed: ${error.message}`);
     return [];
   }
-  return (data ?? []).map((r: { id: string; frontmatter: Record<string, unknown> | null }) => ({
+  return (data ?? []).map((r: { id: string; frontmatter: Record<string, unknown> | null; body: string | null }) => ({
     id: r.id,
     title: (r.frontmatter?.title as string) || r.id,
+    summary: (r.body ?? "").slice(0, 300).replace(/\n/g, " ").trim(),
   }));
 }
 
@@ -493,12 +503,15 @@ async function callSkeletonLLM(
   prefix: string,
   featureId: string,
   project: string,
-  shippedClauses: Array<{ id: string; title: string }> = [],
+  shippedClauses: ShippedClause[] = [],
 ): Promise<{ stubs: ClauseStub[]; customer_experience: string; tokens_in: number; tokens_out: number; cost_usd: number }> {
   let shippedSection = "";
   if (shippedClauses.length > 0) {
-    const shippedList = shippedClauses.slice(0, 100).map(c => `- ${c.id}: ${c.title}`).join("\n");
-    shippedSection = `\n\n## Already Shipped (DO NOT regenerate these — they are DONE)\n${shippedList}\n\nIMPORTANT: Do NOT create stubs for work that overlaps with the shipped clauses above. Only generate stubs for NEW work not yet covered.`;
+    const shippedList = shippedClauses.slice(0, 100).map(c => {
+      const body = c.summary ? ` — ${c.summary}` : "";
+      return `- ${c.id}: ${c.title}${body}`;
+    }).join("\n");
+    shippedSection = `\n\n## Already Shipped (DO NOT regenerate these — they are DONE)\nThe following ${shippedClauses.length} clauses are already built and deployed. Read each summary carefully. Do NOT create stubs that duplicate or overlap with this shipped work — even under a different name.\n\n${shippedList}\n\nIMPORTANT: If the work described in a shipped clause above covers what you're about to generate, SKIP IT. Only generate stubs for genuinely NEW work not covered above.`;
   }
   const userMessage = sourceContext + shippedSection + `\n\n## Instructions\nDecompose this feature into clause STUBS for UNSHIPPED work only.\nUse clause ID prefix: ${prefix} (e.g., ${prefix}.1, ${prefix}.2, ...)\nFoundation/infrastructure clauses come first (lower sequence_order).\nEvery grill decision must be traceable to at least one clause stub.\nSkip any work already covered by the shipped clauses listed above.`;
 
@@ -749,8 +762,8 @@ async function generateClausesFromSource(
   }
   const sourceContext = buildSourceContext(featureId, featureName, description, sourceMaterial, projectTag, prefix);
 
-  // Load shipped clauses so skeleton doesn't regenerate completed work
-  const shippedClauses = await loadShippedClauses(projectTag);
+  // Load shipped clauses scoped to this project so skeleton doesn't regenerate completed work
+  const shippedClauses = await loadShippedClauses(projectTag, prefix);
 
   // ─── Phase 1: Skeleton ────────────────────────────────────────────────────
   const skeleton = await callSkeletonLLM(sourceContext, prefix, featureId, projectTag, shippedClauses);
