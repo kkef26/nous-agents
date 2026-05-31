@@ -627,6 +627,17 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
     parsed = {
       customer_experience: (yamlMeta?.customer_experience as string) ?? "",
       clauses: yamlDocs as GenerateLLMOutput["clauses"],
+
+    // Fallback: if YAML parse yielded 0 clauses, the LLM may have returned JSON
+    if ((!parsed.clauses || parsed.clauses.length === 0) && text.includes('"clauses"')) {
+      try {
+        const jsonFallback = JSON.parse(text);
+        if (jsonFallback.clauses && jsonFallback.clauses.length > 0) {
+          parsed = jsonFallback as GenerateLLMOutput;
+          console.warn(`[scoper] YAML parse yielded 0 clauses, JSON fallback found ${parsed.clauses.length}`);
+        }
+      } catch { /* JSON fallback also failed — stay with YAML result */ }
+    }
     } as GenerateLLMOutput;
   } catch (err) {
     await emitPipelineEvent({
