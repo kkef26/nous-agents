@@ -53,7 +53,7 @@ async function handleBatchVerify(req: Request): Promise<Response> {
   const { data: pending, error: qErr } = await (sb as any)
     .from("dispatch_queue")
     .select("id, clause_id, status, agent_id")
-    .eq("status", "complete")
+    .in("status", ["complete", "done"])
     .order("updated_at", { ascending: true })
     .limit(limit);
   if (qErr) return jsonResponse({ error: "query_failed", detail: qErr.message }, 500);
@@ -67,7 +67,8 @@ async function handleBatchVerify(req: Request): Promise<Response> {
     .from("conductor_log")
     .select("dispatch_id")
     .in("dispatch_id", dispatchIds)
-    .eq("step_name", "emit_verdict");
+    .eq("step_name", "verify")
+    .not("verdict", "is", null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const verifiedSet = new Set((alreadyVerified || []).map((r: any) => r.dispatch_id));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
