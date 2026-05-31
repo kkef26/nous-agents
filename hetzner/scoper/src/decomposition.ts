@@ -175,42 +175,38 @@ You are in BATCH ENRICHMENT MODE: you receive clause STUBS (IDs, titles, briefs)
 Each clause is a work unit that a single AI worker (Claude Code agent) will build in one session (~30-60 min). Think of a clause as one PR's worth of work.
 
 ## Output Format
-Output as YAML multi-document. Each clause is a separate YAML document separated by ---.
-The FIRST document has only customer_experience. Each subsequent document is one clause.
-Use YAML block scalars (|) for the body field. Do NOT output JSON. Do NOT wrap in fences.
+Output as markdown documents with YAML frontmatter. Separate each clause with a line containing only ===CLAUSE===.
+The FIRST block is metadata (just customer_experience). Each subsequent block is one clause.
+The frontmatter (between --- lines) contains structured fields. The body below the frontmatter is free-form markdown.
+Do NOT wrap output in code fences. Do NOT output raw JSON or raw YAML.
 
+---
 customer_experience: "When this feature ships, the user..."
 ---
+
+===CLAUSE===
+
+---
 id: PREFIX.1
-title: Short imperative title
+title: "Short imperative title"
 clause_type: feature
 critical_path: true
 requires: []
 enables: [PREFIX.2]
 sequence_order: 1
-body: |
-  ## Why
-  ...
-  ## What
-  ...
-  ## How
-  ...
-  ## Files
-  - path/to/file.ts
 acceptance_criteria:
   - id: AC01
     text: "When X happens, the system does Y"
     verification: auto
-    form: technical_spec
 contract:
   elements:
     - id: E01
       kind: endpoint
-      name: POST /example
+      name: "POST /example"
   exclusions:
     - kind: feature
-      name: what is NOT in scope
-      prior: why excluded
+      name: "what is NOT in scope"
+      prior: "why excluded"
   antipatterns:
     - id: AP01
       text: "Do NOT do X because reason"
@@ -219,6 +215,19 @@ contract:
       method: curl
       command: "curl -s http://localhost:3000/example"
       expect: "200 OK"
+---
+
+## Why
+One paragraph on why this clause exists and what problem it solves.
+
+## What
+Detailed implementation spec. Every step the worker needs to take.
+
+## How
+Key technical approach, patterns to follow, libraries to use.
+
+## Files
+- path/to/file.ts — what this file does
 
 ## Rules
 - Use the EXACT clause IDs from the stubs. Do NOT add, remove, or renumber.
@@ -621,17 +630,59 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
   let parsed: GenerateLLMOutput;
   try {
-    // YAML multi-document parse with JSON fallback
-    const yamlDocs: unknown[] = [];
-    yaml.loadAll(text.replace(/^\s*\`\`\`[\w]*\s*\n?/, "").replace(/\n?\s*\`\`\`\s*$/, ""), (doc: unknown) => { if (doc) yamlDocs.push(doc); });
-    const meta = (yamlDocs[0] && typeof yamlDocs[0] === "object" && "customer_experience" in (yamlDocs[0] as Record<string, unknown>))
-      ? yamlDocs.shift() as Record<string, unknown> : null;
-    const yamlClauses = yamlDocs.filter(d => d && typeof d === "object" && "id" in (d as Record<string, unknown>));
-    if (yamlClauses.length > 0) {
-      parsed = { customer_experience: (meta?.customer_experience as string) ?? "", clauses: yamlClauses as GenerateLLMOutput["clauses"] } as GenerateLLMOutput;
-    } else {
-      // Fallback: LLM may have returned JSON despite YAML prompt
-      parsed = JSON.parse(text);
+    // Markdown+frontmatter parser: split on ===CLAUSE===, parse each block
+    const cleaned = text.replace(/^\s*```[\w]*\s*\n?/i, "").replace(/\n?\s*```\s*$/i, "").trim();
+    const blocks = cleaned.split(/\n*===CLAUSE===\n*/);
+    let customerExperience = "";
+    const clauses: GenerateLLMOutput["clauses"] = [];
+
+    for (const block of blocks) {
+      const trimmed = block.trim();
+      if (!trimmed) continue;
+
+      // Extract frontmatter between --- delimiters
+      const fmMatch = trimmed.match(/^---\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/);
+      if (!fmMatch) {
+        // Try JSON fallback for entire output
+        if (trimmed.startsWith("{")) {
+          parsed = JSON.parse(cleaned);
+          break;
+        }
+        continue;
+      }
+
+      const frontmatterText = fmMatch[1];
+      const bodyText = (fmMatch[2] || "").trim();
+
+      // Parse frontmatter YAML (short, structured — safe for yaml.load)
+      let fm: Record<string, unknown>;
+      try {
+        fm = yaml.load(frontmatterText) as Record<string, unknown>;
+      } catch (yamlErr) {
+        console.warn(`[scoper] frontmatter YAML parse failed for block, skipping: ${(yamlErr as Error).message}`);
+        continue;
+      }
+
+      if (!fm || typeof fm !== "object") continue;
+
+      // First block: metadata with customer_experience
+      if ("customer_experience" in fm && !("id" in fm)) {
+        customerExperience = fm.customer_experience as string;
+        continue;
+      }
+
+      // Clause block: frontmatter has structured fields, body is markdown
+      if ("id" in fm) {
+        clauses.push({
+          ...fm,
+          body: bodyText || (fm.body as string) || "",
+        } as GenerateLLMOutput["clauses"][0]);
+      }
+    }
+
+    // If we didn't break out to JSON fallback above
+    if (!parsed!) {
+      parsed = { customer_experience: customerExperience, clauses };
     }
   } catch (err) {
     await emitPipelineEvent({
@@ -646,7 +697,7 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
         clause_titles: batchStubs.map((s) => s.title),
       },
     });
-    throw new Error(`Batch ${batchIndex + 1} JSON parse failed: ${(err as Error).message}: ${text.slice(0, 300)}`);
+    throw new Error(`Batch ${batchIndex + 1} parse failed: ${(err as Error).message}: ${text.slice(0, 300)}`);
   }
 
   await emitPipelineEvent({
