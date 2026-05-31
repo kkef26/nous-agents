@@ -420,12 +420,17 @@ function buildSourceContext(
       if (gd.content) parts.push(`  ${gd.content.slice(0, 600)}`);
     }
   }
-  if (sourceMaterial.project_grill_decisions.length > 0) {
+  // Only include project-wide decisions when there are NO feature-specific ones.
+  // When feature-specific decisions exist, they define the scope — project-wide
+  // context causes the LLM to generate clauses for the entire project.
+  if (sourceMaterial.project_grill_decisions.length > 0 && sourceMaterial.grill_decisions.length === 0) {
     parts.push(`\n## Grill Decisions — Project-Wide (${sourceMaterial.project_grill_decisions.length})`);
     for (const gd of sourceMaterial.project_grill_decisions.slice(0, 20)) {
       parts.push(`- ${gd.source_id}: ${gd.title ?? ""}`);
       if (gd.content) parts.push(`  ${gd.content.slice(0, 300)}`);
     }
+  } else if (sourceMaterial.project_grill_decisions.length > 0) {
+    parts.push(`\n_(${sourceMaterial.project_grill_decisions.length} project-wide decisions omitted — feature-specific decisions define scope)_`);
   }
   if (sourceMaterial.architecture_docs.length > 0) {
     parts.push(`\n## Architecture Documents`);
