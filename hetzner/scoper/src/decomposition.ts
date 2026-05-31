@@ -684,7 +684,9 @@ async function generateClausesFromSource(
 ): Promise<DecompositionOutput> {
   const sourceMaterial = await loadFeatureSourceMaterial(featureId, projectTag);
   // Scope check: warn if grill decisions span too many distinct sources (likely needs splitting)
-  const distinctSources = new Set(sourceMaterial.grill_decisions.map(g => g.source_id?.split("-")[0] || "unknown"));
+  // Filter to only this feature's grill decisions for scope check (not other features' decisions that share the project)
+  const featureSpecificGrills = sourceMaterial.grill_decisions.filter(g => g.feature_id === featureId || g.feature_id === null);
+  const distinctSources = new Set(featureSpecificGrills.map(g => g.source_id?.split("-")[0] || "unknown"));
   if (distinctSources.size > 4) {
     console.warn(`[scoper] scope warning: ${featureId} has grill decisions from ${distinctSources.size} distinct sources — consider splitting into multiple features`);
     await emitPipelineEvent({
