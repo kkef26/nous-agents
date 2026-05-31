@@ -19,6 +19,7 @@ import { getSupabaseClient } from "./lib/common/db.js";
 import { costFromTokens, tokensFromResponse } from "./lib/common/cost.js";
 import type { AnthropicResponseLike } from "./lib/common/types.js";
 import { loadFeatureSourceMaterial } from "./lib/common/source_material.js";
+import yaml from "js-yaml";
 import type { FeatureSourceMaterial, SourceMaterialRow } from "./lib/common/source_material.js";
 import { MOLD_SIZE, emitPipelineEvent } from "./_shared.js";
 
@@ -174,44 +175,69 @@ You are in BATCH ENRICHMENT MODE: you receive clause STUBS (IDs, titles, briefs)
 Each clause is a work unit that a single AI worker (Claude Code agent) will build in one session (~30-60 min). Think of a clause as one PR's worth of work.
 
 ## Output Format
-Output ONLY valid JSON (no prose, no markdown fences):
-{
-  "customer_experience": "Working Backwards: when this feature ships, the user...",
-  "clauses": [
-    {
-      "id": "<EXACT_STUB_ID>",
-      "title": "Short imperative title",
-      "clause_type": "feature|infrastructure|migration|fix|qa|config|integration",
-      "critical_path": true|false,
-      "requires": ["<clause_id>", ...],
-      "enables": ["<clause_id>", ...],
-      "sequence_order": 1,
-      "body": "Full clause body: ## Why\\n...\\n## What\\n...\\n## How\\n...\\n## Files\\n...",
-      "acceptance_criteria": [
-        {
-          "id": "AC01",
-          "text": "When/Given..., the system...",
-          "verification": "auto|physical_qa|kosta_review",
-          "form": "ulwick|technical_spec"
-        }
-      ],
-      "contract": {
-        "elements": [{"id": "E01", "kind": "endpoint|component|table|migration|edge_fn|cron|interaction", "name": "..."}],
-        "exclusions": [{"kind": "...", "name": "what is NOT in scope", "prior": "why excluded"}],
-        "antipatterns": [{"id": "AP01", "text": "Do NOT ... because [reason]"}],
-        "verification": [{"target": "AC01", "method": "curl|sql|grep|visual|code_check", "command": "actual command", "expect": "expected output"}]
-      }
-    }
-  ]
-}
+Output as YAML multi-document. Each clause is a separate YAML document separated by ---
+The FIRST document is metadata with customer_experience. Subsequent documents are individual clauses.
+Use YAML block scalars (|) for multi-line text fields like body.
+Do NOT wrap in markdown fences. Do NOT output JSON.
+
+Example:
+
+customer_experience: "When this feature ships, the user..."
+---
+id: PREFIX.1
+title: Short imperative title
+clause_type: feature
+critical_path: true
+requires: []
+enables: [PREFIX.2]
+sequence_order: 1
+body: |
+  ## Why
+  Reason this clause exists.
+
+  ## What
+  What gets built.
+
+  ## How
+  Implementation approach.
+
+  ## Files
+  - path/to/file.ts
+acceptance_criteria:
+  - id: AC01
+    text: "When X happens, the system does Y"
+    verification: auto
+    form: technical_spec
+contract:
+  elements:
+    - id: E01
+      kind: endpoint
+      name: POST /example
+  exclusions:
+    - kind: feature
+      name: what is NOT in scope
+      prior: why excluded
+  antipatterns:
+    - id: AP01
+      text: "Do NOT do X because reason"
+  verification:
+    - target: AC01
+      method: curl
+      command: "curl -s http://localhost:3000/example"
+      expect: "200 OK with JSON body"
+---
+id: PREFIX.2
+title: Next clause
+...
 
 ## Rules
 - Use the EXACT clause IDs from the stubs. Do NOT add, remove, or renumber.
-- Each clause body MUST have: ## Why, ## What, ## How, ## Files
+- Each clause body MUST have: ## Why, ## What, ## How, ## Files — use YAML block scalar (|).
 - 2-8 ACs per clause. "auto" ACs must include concrete verification commands.
 - BANNED: "works correctly", "no regressions", "ships when pushed"
 - Every grill decision must be reflected in at least one clause body, AC, or antipattern.
-- Deferred items go in contract.exclusions.`;
+- Deferred items go in contract.exclusions.
+- NEVER use JSON. Output YAML only.`;
 
 const ENRICHMENT_SYSTEM_PROMPT = `You are Scoper, the autonomous planning engine for the NOUS factory pipeline.
 You are in ENRICH MODE: clauses already exist with bodies written by a human planner.
@@ -593,7 +619,15 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
   const cost_usd = (tokens_in * 15 + tokens_out * 75) / 1_000_000;
   let parsed: GenerateLLMOutput;
   try {
-    parsed = JSON.parse(text);
+    // YAML multi-document parse — truncation-resilient
+    const yamlDocs: unknown[] = [];
+    yaml.loadAll(text.replace(/^\s*```(?:ya?ml)?\s*\n?/i, "").replace(/\n?\s*```\s*$/i, ""), (doc: unknown) => { if (doc) yamlDocs.push(doc); });
+    // First doc is metadata (customer_experience), rest are clauses
+    const yamlMeta = (yamlDocs[0] && typeof yamlDocs[0] === "object" && "customer_experience" in (yamlDocs[0] as Record<string, unknown>)) ? yamlDocs.shift() as Record<string, unknown> : null;
+    parsed = {
+      customer_experience: (yamlMeta?.customer_experience as string) ?? "",
+      clauses: yamlDocs as GenerateLLMOutput["clauses"],
+    } as GenerateLLMOutput;
   } catch (err) {
     await emitPipelineEvent({
       feature_id: featureId,
@@ -607,7 +641,7 @@ Each clause body must have: ## Why, ## What, ## How, ## Files.
         clause_titles: batchStubs.map((s) => s.title),
       },
     });
-    throw new Error(`Batch ${batchIndex + 1} JSON parse failed: ${(err as Error).message}: ${text.slice(0, 300)}`);
+    throw new Error(`Batch ${batchIndex + 1} YAML parse failed: ${(err as Error).message}: ${text.slice(0, 300)}`);
   }
 
   await emitPipelineEvent({
