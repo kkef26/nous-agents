@@ -59,11 +59,25 @@ export async function loadFeatureSourceMaterial(
 ): Promise<FeatureSourceMaterial> {
   const sb = getSupabaseClient();
 
-  const { data, error } = await sb
-    .from("feature_source_material")
-    .select("feature_id, project, source_type, source_id, title, content, category, severity, created_at")
-    .or(`feature_id.eq.${featureId},project.eq.${project}`)
-    .order("created_at", { ascending: true });
+  // Two-pass query: feature-specific decisions are scoped tightly;
+  // project-wide material (architecture, resolutions) is included as context.
+  // This prevents other features' grill decisions from polluting the scope.
+  const [featureResult, projectResult] = await Promise.all([
+    // Pass 1: feature-specific grill decisions only
+    sb.from("feature_source_material")
+      .select("feature_id, project, source_type, source_id, title, content, category, severity, created_at")
+      .eq("feature_id", featureId)
+      .order("created_at", { ascending: true }),
+    // Pass 2: project-wide material (non-feature-specific: architecture docs, resolutions, project-wide grills)
+    sb.from("feature_source_material")
+      .select("feature_id, project, source_type, source_id, title, content, category, severity, created_at")
+      .eq("project", project)
+      .is("feature_id", null)
+      .order("created_at", { ascending: true }),
+  ]);
+
+  const error = featureResult.error || projectResult.error;
+  const data = [...(featureResult.data ?? []), ...(projectResult.data ?? [])];
 
   if (error) {
     throw new Error(`loadFeatureSourceMaterial: ${error.message}`);
