@@ -699,7 +699,21 @@ async function generateClausesFromSource(
     };
   }
 
-  const prefix = featureId.includes(".") ? featureId : `${projectTag.toUpperCase()}.${featureId}`;
+  // NST.96.2: Read clause_prefix from nous.projects — canonical source for project identity
+  let prefix: string;
+  if (featureId.includes(".")) {
+    prefix = featureId;
+  } else {
+    const sb = getSupabaseClient();
+    const { data: projRow } = await (sb as any)
+      .from("projects")
+      .select("clause_prefix")
+      .eq("tag", projectTag)
+      .maybeSingle();
+    prefix = projRow?.clause_prefix
+      ? `${projRow.clause_prefix}.${featureId}`
+      : `${projectTag.toUpperCase()}.${featureId}`;
+  }
   const sourceContext = buildSourceContext(featureId, featureName, description, sourceMaterial, projectTag, prefix);
 
   // Load shipped clauses so skeleton doesn't regenerate completed work
