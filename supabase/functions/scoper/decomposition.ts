@@ -97,63 +97,6 @@ interface GrillDecisionRow {
 
 // ─── LLM system prompt (generate mode — creates clauses from scratch) ───────
 
-const DECOMPOSITION_SYSTEM_PROMPT = `You are Scoper, the autonomous planning engine for the NOUS factory pipeline.
-Your job: receive a feature description, grill decisions, and architecture doc — then perform
-Working Backwards decomposition to generate bible clauses.
-
-Working Backwards: start from the customer experience (what the user sees when this ships),
-derive preconditions (what must be true for that experience to exist), then derive clauses
-(units of work) for each precondition.
-
-Each clause you generate must include:
-1. A descriptive title (imperative, e.g. "Build the dispatch retry handler")
-2. A clause_type: one of "feature", "implementation", "migration", "bugfix", "ui", "infrastructure", "integration"
-3. Whether it's critical_path (true if downstream clauses depend on it or if the feature can't ship without it)
-4. requires: IDs of other clauses this one depends on (use PLACEHOLDER IDs like "C1", "C2" — they'll be replaced)
-5. enables: IDs of clauses this one unblocks
-6. A body: the detailed spec of what to build (3-15 lines, specific enough that a cold-start worker can build it)
-7. acceptance_criteria: array of ACs in this format:
-   { "id": "AC01", "text": "...", "verification": "auto|physical_qa|kosta_review", "form": "ulwick|technical_spec" }
-   - Use "ulwick" form for user-facing outcomes ("When X, the user can Y so that Z")
-   - Use "technical_spec" form for plumbing ("Endpoint returns 200 with schema {...}")
-   - verification: "auto" for things testable by curl/grep/sql, "physical_qa" for UI, "kosta_review" for brand/tone
-8. contract: the full verification contract:
-   {
-     "elements": [{"id": "E01", "kind": "endpoint|component|table|interaction|side_effect", "name": "..."}],
-     "exclusions": [{"id": "X01", "kind": "...", "name": "...", "prior": "reason not in scope"}],
-     "antipatterns": [{"id": "AP01", "text": "Do NOT ..."}],
-     "verification": [{"target": "E01|X01|AC01", "method": "curl|sql|visual|code_check|e2e", "command": "...", "expect": "..."}]
-   }
-   Derive antipatterns from the grill decisions — invert each decision into what NOT to do.
-   Verification commands must be concrete: actual curl commands, SQL queries, grep patterns.
-
-Output ONLY valid JSON in this exact shape (no prose, no markdown fences):
-{
-  "customer_experience": "When this feature ships, ...",
-  "preconditions": ["Precondition 1", "Precondition 2"],
-  "clauses": [
-    {
-      "placeholder_id": "C1",
-      "title": "...",
-      "clause_type": "...",
-      "critical_path": true|false,
-      "requires": [],
-      "enables": ["C2"],
-      "body": "...",
-      "acceptance_criteria": [...],
-      "contract": {...}
-    }
-  ]
-}
-
-Rules:
-- Minimum 1 clause, maximum 12 per feature. If more are needed, the feature should be split.
-- Order clauses by dependency: foundations first, UI last.
-- Every element in contract.elements must have a matching verification entry.
-- Every exclusion must have a matching verification entry (method: code_check, expect: "no matches").
-- Keep bodies specific to THIS project's stack and conventions from the architecture doc.
-- Do NOT invent requirements not covered by the grill decisions or feature description.
-- If a grill decision defers something, add it to exclusions, not elements.`;
 
 // ─── LLM enrichment prompt (enrich mode — enriches existing clauses) ────────
 // AGT.1.2.A1: This prompt is used when clauses already exist but need proper
@@ -224,28 +167,6 @@ Rules:
 
 // ─── Few-shot contract example (injected into user message) ─────────────────
 
-const CONTRACT_EXAMPLE = `Example contract from a real clause (NST.28):
-{
-  "elements": [
-    {"id": "E01", "kind": "table", "name": "nous.punch_list_items"},
-    {"id": "E02", "kind": "component", "name": "capture overlay"},
-    {"id": "E03", "kind": "component", "name": "clause drawer tab"},
-    {"id": "E04", "kind": "interaction", "name": "badge count"},
-    {"id": "E05", "kind": "endpoint", "name": "API endpoint /nous/punch-list"}
-  ],
-  "exclusions": [
-    {"kind": "display", "name": "Gate telemetry display", "prior": "stays on Factory Inspector"},
-    {"kind": "infra", "name": "Screenshot hosting infra", "prior": "use existing Supabase storage"}
-  ],
-  "antipatterns": [
-    {"id": "AP01", "text": "Do NOT build custom screenshot storage — use existing Supabase storage bucket"}
-  ],
-  "verification": [
-    {"target": "X01", "method": "code_check", "command": "grep -r telemetry src/components/PunchList", "expect": "no matches"},
-    {"target": "E01", "method": "sql", "command": "SELECT * FROM nous.punch_list_items LIMIT 1", "expect": "table exists with expected columns"},
-    {"target": "E05", "method": "curl", "command": "curl /nous/punch-list?clause_id=X", "expect": "200 with items array"}
-  ]
-}`;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -394,7 +315,6 @@ function buildEnrichmentMessage(
     parts.push(bodyPreview);
   }
 
-  parts.push(`\n## Contract Example\n${CONTRACT_EXAMPLE}`);
 
   parts.push(`\n## Instructions\nEnrich each clause above with:
 1. 2-8 acceptance criteria (Ulwick form for user-facing, technical_spec for plumbing)
@@ -406,43 +326,40 @@ Use the EXACT clause IDs shown above. Do NOT rename them.`);
   return parts.join("\n");
 }
 
+
 async function callEnrichmentLLM(userMessage: string): Promise<{
   parsed: EnrichmentLLMOutput;
   tokens_in: number;
   tokens_out: number;
   cost_usd: number;
 }> {
-  const proxyUrl = Deno.env.get("STATION_PROXY_URL");
-  const apiKey = Deno.env.get("NOUS_API_KEY");
-  if (!proxyUrl || !apiKey) {
-    throw new Error("STATION_PROXY_URL or NOUS_API_KEY not set — cannot call LLM for enrichment");
+  const proxyUrl = Deno.env.get("STATION_PROXY_URL") ?? "http://54.174.233.250:8095";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 130_000);
+
+  let response: Response;
+  try {
+    response = await fetch(`${proxyUrl}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "sonnet",
+        max_tokens: 8192,
+        system: ENRICHMENT_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }],
+      }),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const requestBody = {
-    model: "sonnet",
-    max_tokens: 8192,
-    system: ENRICHMENT_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
-    account: "c2",
-  };
-
-  const response = await fetch(`${proxyUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-    },
-    body: JSON.stringify(requestBody),
-  });
 
   const raw = await response.text();
   if (!response.ok) {
-    throw new Error(`station-proxy enrichment ${response.status}: ${raw.slice(0, 400)}`);
+    throw new Error(`station-proxy ${response.status}: ${raw.slice(0, 400)}`);
   }
 
-  let apiResponse: AnthropicResponseLike & {
-    content?: Array<{ type: string; text: string }>;
-  };
+  let apiResponse: { content?: Array<{ type: string; text: string }>; usage?: { input_tokens: number; output_tokens: number } };
   try {
     apiResponse = JSON.parse(raw);
   } catch (err) {
@@ -453,6 +370,10 @@ async function callEnrichmentLLM(userMessage: string): Promise<{
   const outputText = textBlock?.text ?? "";
   const cleaned = stripJsonFences(outputText);
 
+  const tokens_in = apiResponse.usage?.input_tokens ?? 0;
+  const tokens_out = apiResponse.usage?.output_tokens ?? 0;
+  const cost_usd = (tokens_in * 3 + tokens_out * 15) / 1_000_000;
+
   let parsed: EnrichmentLLMOutput;
   try {
     parsed = JSON.parse(cleaned);
@@ -460,20 +381,23 @@ async function callEnrichmentLLM(userMessage: string): Promise<{
     throw new Error(`Enrichment LLM JSON parse failed: ${(err as Error).message}: ${cleaned.slice(0, 300)}`);
   }
 
-  // Validate structure
-  if (!parsed.customer_experience || !Array.isArray(parsed.enriched_clauses)) {
-    throw new Error(`Enrichment LLM output missing required fields: ${Object.keys(parsed).join(", ")}`);
+  return { parsed, tokens_in, tokens_out, cost_usd };
+}
+
+
+
+async function loadGrillDecisions(featureId: string, project: string): Promise<GrillDecisionRow[]> {
+  const sb = getSupabaseClient();
+  // deno-lint-ignore no-explicit-any
+  const { data, error } = await (sb as any)
+    .from("grill_decisions")
+    .select("id, decision, rationale, category, severity")
+    .or(`feature_id.eq.${featureId},project.eq.${project}`)
+    .order("created_at", { ascending: true });
+  if (error) {
+    throw new Error(`decomposition.loadGrillDecisions: ${error.message}`);
   }
-
-  const tokens = tokensFromResponse(apiResponse);
-  const cost_usd = costFromTokens("claude-opus-4-6", tokens.tokens_in, tokens.tokens_out);
-
-  return {
-    parsed,
-    tokens_in: tokens.tokens_in,
-    tokens_out: tokens.tokens_out,
-    cost_usd,
-  };
+  return (data ?? []) as GrillDecisionRow[];
 }
 
 async function enrichWithLLM(
@@ -666,381 +590,6 @@ async function enrichExistingClauses(
   };
 }
 
-// ─── Generate mode: LLM-powered clause creation ────────────────────────────
-
-async function loadGrillDecisions(featureId: string, project: string): Promise<GrillDecisionRow[]> {
-  const sb = getSupabaseClient();
-  // deno-lint-ignore no-explicit-any
-  const { data, error } = await (sb as any)
-    .from("grill_decisions")
-    .select("id, decision, rationale, category, severity")
-    .or(`feature_id.eq.${featureId},project.eq.${project}`)
-    .order("created_at", { ascending: true });
-  if (error) {
-    throw new Error(`decomposition.loadGrillDecisions: ${error.message}`);
-  }
-  return (data ?? []) as GrillDecisionRow[];
-}
-
-async function resolvePrefix(project: string): Promise<string> {
-  const sb = getSupabaseClient();
-  // deno-lint-ignore no-explicit-any
-  const { data } = await (sb as any)
-    .from("bible_clauses")
-    .select("prefix")
-    .eq("feature_id", project)
-    .limit(1);
-  if (data && data.length > 0) return data[0].prefix;
-
-  const TAG_PREFIX_MAP: Record<string, string> = {
-    "nous-station": "NST",
-    "nous-agents": "AGT",
-    "catering": "CAT",
-    "mise": "MISE",
-    "sidework": "SDW",
-    "axio": "AXO",
-    "paideia": "PAI",
-    "solid": "SOL",
-    "pliromi": "PLR",
-    "themelio": "THM",
-    "ergotaxia": "ERG",
-    "ovation": "OVA",
-    "toll-router": "TLR",
-    "pesto": "PST",
-    "kaei": "KAEI",
-  };
-  return TAG_PREFIX_MAP[project] ?? project.toUpperCase().slice(0, 3);
-}
-
-async function getNextSequence(prefix: string, featureId: string): Promise<number> {
-  const sb = getSupabaseClient();
-  const featureMatch = featureId.match(/\.(\d+)$/);
-  const featureNum = featureMatch ? featureMatch[1] : featureId;
-  const idPattern = `${prefix}.${featureNum}.%`;
-
-  // deno-lint-ignore no-explicit-any
-  const { data } = await (sb as any)
-    .from("bible_clauses")
-    .select("id")
-    .like("id", idPattern)
-    .order("id", { ascending: false })
-    .limit(1);
-
-  if (data && data.length > 0) {
-    const lastId = data[0].id as string;
-    const parts = lastId.split(".");
-    const lastNum = parseInt(parts[parts.length - 1], 10);
-    return isNaN(lastNum) ? 1 : lastNum + 1;
-  }
-  return 1;
-}
-
-interface LLMClauseOutput {
-  placeholder_id: string;
-  title: string;
-  clause_type: string;
-  critical_path: boolean;
-  requires: string[];
-  enables: string[];
-  body: string;
-  acceptance_criteria: AcceptanceCriterion[];
-  contract: ClauseContract;
-}
-
-interface LLMDecompositionOutput {
-  customer_experience: string;
-  preconditions: string[];
-  clauses: LLMClauseOutput[];
-}
-
-async function callDecompositionLLM(userMessage: string): Promise<{
-  parsed: LLMDecompositionOutput;
-  tokens_in: number;
-  tokens_out: number;
-  cost_usd: number;
-}> {
-  const proxyUrl = Deno.env.get("STATION_PROXY_URL");
-  const apiKey = Deno.env.get("NOUS_API_KEY");
-  if (!proxyUrl || !apiKey) {
-    throw new Error("STATION_PROXY_URL or NOUS_API_KEY not set — cannot call LLM");
-  }
-
-  const requestBody = {
-    model: "opus",
-    max_tokens: 8192,
-    system: DECOMPOSITION_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userMessage }],
-    account: "c2",
-  };
-
-  const response = await fetch(`${proxyUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-    },
-    body: JSON.stringify(requestBody),
-  });
-
-  const raw = await response.text();
-  if (!response.ok) {
-    throw new Error(`station-proxy ${response.status}: ${raw.slice(0, 400)}`);
-  }
-
-  let apiResponse: AnthropicResponseLike & {
-    content?: Array<{ type: string; text: string }>;
-  };
-  try {
-    apiResponse = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`station-proxy returned non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
-  }
-
-  const textBlock = apiResponse.content?.find((c) => c.type === "text");
-  const outputText = textBlock?.text ?? "";
-  const cleaned = stripJsonFences(outputText);
-
-  let parsed: LLMDecompositionOutput;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    throw new Error(`Decomposition LLM JSON parse failed: ${(err as Error).message}: ${cleaned.slice(0, 300)}`);
-  }
-
-  if (!parsed.customer_experience || !Array.isArray(parsed.clauses)) {
-    throw new Error(`Decomposition LLM output missing required fields: ${Object.keys(parsed).join(", ")}`);
-  }
-  if (parsed.clauses.length === 0) {
-    throw new Error("Decomposition LLM returned zero clauses");
-  }
-  if (parsed.clauses.length > 12) {
-    throw new Error(`Decomposition LLM returned ${parsed.clauses.length} clauses (max 12)`);
-  }
-
-  const tokens = tokensFromResponse(apiResponse);
-  const cost_usd = costFromTokens("claude-opus-4-6", tokens.tokens_in, tokens.tokens_out);
-
-  return {
-    parsed,
-    tokens_in: tokens.tokens_in,
-    tokens_out: tokens.tokens_out,
-    cost_usd,
-  };
-}
-
-function buildUserMessage(
-  featureId: string,
-  featureName: string | undefined,
-  description: string | undefined,
-  grillDecisions: GrillDecisionRow[],
-  architectureDoc: string | null,
-  projectTag: string,
-  prefix: string,
-): string {
-  const parts: string[] = [];
-
-  parts.push(`## Feature\n- ID: ${featureId}\n- Name: ${featureName ?? "(unnamed)"}\n- Project: ${projectTag}\n- Prefix: ${prefix}\n- Description: ${description ?? "(no description)"}`);
-
-  if (grillDecisions.length > 0) {
-    parts.push(`\n## Grill Decisions (${grillDecisions.length} resolved)`);
-    for (const gd of grillDecisions) {
-      const sev = gd.severity ? ` [${gd.severity}]` : "";
-      const cat = gd.category ? ` (${gd.category})` : "";
-      parts.push(`- ${gd.decision}${sev}${cat}\n  Rationale: ${gd.rationale}`);
-    }
-  }
-
-  if (architectureDoc) {
-    parts.push(`\n## Architecture Document\n${architectureDoc}`);
-  }
-
-  parts.push(`\n## Contract Example\n${CONTRACT_EXAMPLE}`);
-
-  parts.push(`\n## Instructions\nDecompose this feature into bible clauses using Working Backwards. Start from the customer experience, derive preconditions, then derive clauses. Use placeholder IDs (C1, C2, ...) for cross-references in requires/enables — they will be replaced with real IDs (${prefix}.XX.1, ${prefix}.XX.2, ...).`);
-
-  return parts.join("\n");
-}
-
-async function supersedeOldClauses(featureId: string, newClauseIds: string[]): Promise<string[]> {
-  const sb = getSupabaseClient();
-  // deno-lint-ignore no-explicit-any
-  const { data: existing } = await (sb as any)
-    .from("bible_clauses")
-    .select("id")
-    .eq("feature_id", featureId)
-    .not("id", "in", `(${newClauseIds.join(",")})`)
-    .in("status", ["draft", "active"]);
-
-  const superseded: string[] = [];
-  if (existing && existing.length > 0) {
-    const oldIds = existing.map((r: { id: string }) => r.id);
-    // deno-lint-ignore no-explicit-any
-    await (sb as any)
-      .from("bible_clauses")
-      .update({
-        status: "deprecated",
-        deprecation: {
-          reason: "superseded_by_scoper_regeneration",
-          superseded_by: newClauseIds,
-          deprecated_at: new Date().toISOString(),
-        },
-        updated_at: new Date().toISOString(),
-      })
-      .in("id", oldIds);
-    superseded.push(...oldIds);
-  }
-  return superseded;
-}
-
-async function insertGeneratedClauses(
-  clauses: LLMClauseOutput[],
-  prefix: string,
-  featureId: string,
-  startSequence: number,
-  sessionId: string,
-): Promise<ClauseSpec[]> {
-  const sb = getSupabaseClient();
-
-  const featureMatch = featureId.match(/\.(\d+)$/);
-  const featureNum = featureMatch ? featureMatch[1] : featureId.replace(/\./g, "_");
-
-  const idMap = new Map<string, string>();
-  for (let i = 0; i < clauses.length; i++) {
-    const realId = `${prefix}.${featureNum}.${startSequence + i}`;
-    idMap.set(clauses[i].placeholder_id, realId);
-  }
-
-  const specs: ClauseSpec[] = [];
-  const rows: Record<string, unknown>[] = [];
-
-  for (let i = 0; i < clauses.length; i++) {
-    const c = clauses[i];
-    const realId = idMap.get(c.placeholder_id)!;
-    const bodyHash = await sha256HexAsync(c.body);
-
-    const requires = c.requires
-      .map((r) => idMap.get(r) ?? r)
-      .filter((r) => r !== realId);
-    const enables = c.enables
-      .map((e) => idMap.get(e) ?? e)
-      .filter((e) => e !== realId);
-
-    const spec: ClauseSpec = {
-      id: realId,
-      prefix,
-      parent_id: [featureId],
-      title: c.title,
-      feature_id: featureId,
-      sequence_order: startSequence + i,
-      maturity_stage: "SPEC",
-      status: "draft",
-      clause_type: c.clause_type,
-      critical_path: c.critical_path,
-      requires,
-      enables,
-      acceptance_criteria: c.acceptance_criteria,
-      body: c.body,
-      contract: c.contract,
-    };
-    specs.push(spec);
-
-    rows.push({
-      id: realId,
-      prefix,
-      revision: "r1",
-      parent_id: [featureId],
-      hash: bodyHash,
-      status: "draft",
-      birth_session: sessionId,
-      birth_author: "scoper-v3",
-      birth_context: `LLM Working Backwards decomposition for feature ${featureId}`,
-      body: c.body,
-      file_path: `bible/${prefix}/${realId}.md`,
-      acceptance_criteria: c.acceptance_criteria,
-      requires,
-      enables,
-      critical_path: c.critical_path,
-      clause_type: c.clause_type,
-      feature_id: featureId,
-      sequence_order: startSequence + i,
-      maturity_stage: "SPEC",
-      contract: c.contract,
-      frontmatter: {
-        title: c.title,
-        generated_by: "scoper-v3",
-        generated_at: new Date().toISOString(),
-      },
-    });
-  }
-
-  // deno-lint-ignore no-explicit-any
-  const { error } = await (sb as any)
-    .from("bible_clauses")
-    .insert(rows);
-  if (error) {
-    throw new Error(`decomposition.insertGeneratedClauses: ${error.message}`);
-  }
-
-  const newClauseIds = specs.map((s) => s.id);
-  // deno-lint-ignore no-explicit-any
-  const { error: fErr } = await (sb as any)
-    .from("features")
-    .update({
-      clauses: newClauseIds,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", featureId);
-  if (fErr) {
-    throw new Error(`decomposition.updateFeatureClauses: ${fErr.message}`);
-  }
-
-  return specs;
-}
-
-async function generateClauses(
-  featureId: string,
-  featureName: string | undefined,
-  description: string | undefined,
-  architectureDoc: string | null,
-  projectTag: string,
-  sessionId: string,
-): Promise<DecompositionOutput> {
-  const grillDecisions = await loadGrillDecisions(featureId, projectTag);
-  const prefix = await resolvePrefix(projectTag);
-  const userMessage = buildUserMessage(
-    featureId, featureName, description,
-    grillDecisions, architectureDoc, projectTag, prefix,
-  );
-  const { parsed, tokens_in, tokens_out, cost_usd } = await callDecompositionLLM(userMessage);
-
-  const startSeq = await getNextSequence(prefix, featureId);
-
-  const featureMatch = featureId.match(/\.(\d+)$/);
-  const featureNum = featureMatch ? featureMatch[1] : featureId.replace(/\./g, "_");
-  const newIds = parsed.clauses.map((_, i) => `${prefix}.${featureNum}.${startSeq + i}`);
-  const _superseded = await supersedeOldClauses(featureId, newIds);
-
-  const specs = await insertGeneratedClauses(
-    parsed.clauses, prefix, featureId, startSeq, sessionId,
-  );
-
-  const preconditions = specs
-    .filter(s => s.requires.length === 0)
-    .map(s => `${s.id} — ${s.title}`);
-
-  return {
-    customer_experience: parsed.customer_experience,
-    preconditions: preconditions.length > 0 ? preconditions : parsed.preconditions,
-    clauses: specs,
-    generated: true,
-    tokens_in,
-    tokens_out,
-    cost_usd,
-  };
-}
-
-// ─── Top-level: route between generate and enrich ───────────────────────────
-
 export async function decomposeFeature(
   featureId: string,
   featureName: string | undefined,
@@ -1052,16 +601,9 @@ export async function decomposeFeature(
     sessionId?: string;
   },
 ): Promise<DecompositionOutput> {
-  // Generate mode: no existing clauses → LLM creates them
-  if (clauseIds.length === 0 && opts?.projectTag && opts?.sessionId) {
-    return await generateClauses(
-      featureId, featureName, description,
-      opts.architectureDoc ?? null,
-      opts.projectTag,
-      opts.sessionId,
-    );
-  }
-
-  // Enrich mode: existing clauses → read + LLM-enrich ACs/contracts (AGT.1.2.A1)
+  // Scoper no longer generates clauses — clause bodies are authored by Cowork
+  // during grilling sessions. If no clauses exist, return empty (plan.ts emits Mode C).
+  // Enrich mode: read existing clauses + derive ACs (LLM enrichment with mechanical fallback)
   return await enrichExistingClauses(featureId, featureName, description, clauseIds, opts);
 }
+
