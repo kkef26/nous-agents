@@ -2,6 +2,7 @@
 // Express server for the Scoper service on port 8090.
 // Routes:
 //   POST /run     — { mode: "plan" | "replan", ... } delegates to plan.ts / replan.ts
+//   POST /audit   — deterministic Pocock codebase quality audit
 //   GET  /status  — liveness + 24h Mode A/B/C counts
 //   GET  /log     — scoper_log reader (cursor + filters)
 //   GET  /health  — basic liveness
@@ -11,6 +12,7 @@ import express, { type Request as ExpressRequest, type Response as ExpressRespon
 import { handleLog, handleStatus } from "./status.js";
 import { handlePlan } from "./plan.js";
 import { handleReplan } from "./replan.js";
+import { handleAudit } from "./audit.js";
 import { writeScoperStep } from "./lib/common/logging.js";
 import { resolveAuditTrail } from "./lib/common/audit_trail.js";
 import { jsonResponse, SCOPER_VERSION } from "./_shared.js";
@@ -90,6 +92,18 @@ app.post("/run", async (req, res) => {
   }
 });
 
+app.post("/audit", async (req, res) => {
+  try {
+    const webReq = await expressToWebRequest(req);
+    const webRes = await handleAudit(webReq);
+    await sendWebResponse(webRes, res);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[scoper] /audit internal error:", message);
+    res.status(500).json({ error: "internal", message });
+  }
+});
+
 app.get("/status", async (req, res) => {
   try {
     const webReq = await expressToWebRequest(req);
@@ -138,4 +152,3 @@ app.listen(PORT, "0.0.0.0", () => {
 
 // Silence "unused" warning when jsonResponse is referenced indirectly via handlers.
 void jsonResponse;
-
