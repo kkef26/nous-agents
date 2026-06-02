@@ -96,6 +96,7 @@ class ThinkingStreamer:
         self._tail_task: Optional[asyncio.Task] = None
         self._flush_task: Optional[asyncio.Task] = None
         self._death_sent = False
+        self._complete_signaled = False
         self._chunks_sent = 0
         self._http: Optional[httpx.AsyncClient] = None
 
@@ -240,6 +241,9 @@ class ThinkingStreamer:
             r = ev.get("result")
             if isinstance(r, str) and r.strip():
                 self._emit({"type": "progress", "percent": 100, "content": _trim(r), "ts": ts})
+            # Signal complete so no further progress events are buffered.
+            # The worker will fire its own complete event to NOUS after this.
+            self.signal_complete()
 
     def _parse_assistant_block(self, block: dict, ts: str) -> None:
         btype = block.get("type")
@@ -285,6 +289,8 @@ class ThinkingStreamer:
 
     # ─── Emit / buffer ────────────────────────────────────────────────────
     def _emit(self, chunk: dict) -> None:
+        if self._complete_signaled:
+            return  # Don't buffer after complete — prevents stale progress on Fleet
         self._ring.append(chunk)
         self._buffer.append(chunk)
 
@@ -350,6 +356,10 @@ class ThinkingStreamer:
             )
 
     # ─── Death report ─────────────────────────────────────────────────────
+    def signal_complete(self) -> None:
+        """Called by pool when worker fires complete event. Stops buffering."""
+        self._complete_signaled = True
+
     async def death_report(
         self,
         exit_code: int,
