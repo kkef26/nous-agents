@@ -1,0 +1,197 @@
+"""Heartbeat monitoring + ghost task cleanup. NST.82.3: per-worker silence + total kill.
+
+v3.1 CHANGES:
+- Log mtime check: if log file growing, worker is alive (don't kill on silence alone)
+- Log capture on kill: tail last 100 lines, save to dispatch_queue.result_metadata
+- get_task_id helper for dispatch release
+"""
+import asyncio
+import logging
+import os
+import time
+import json
+from config import NOUS_URL, NOUS_KEY, SILENCE_KILL_MIN, BASE_TIMEOUT_MIN_PER_CLAUSE
+import pool
+
+logger = logging.getLogger("spawner.watchdog")
+
+CHECK_INTERVAL = 60  # NST.82.3: check every minute
+
+# Log file mtime grace period: if log modified within this many seconds,
+# worker is considered alive regardless of progress events.
+# Claude Code sessions write constantly — tool calls, thinking, output —
+# so log growth IS a reliable liveness signal.
+LOG_ALIVE_GRACE_SECS = 120
+
+
+async def run():
+    """Main watchdog loop. Runs until cancelled."""
+    logger.info(
+        f"Watchdog started (interval={CHECK_INTERVAL}s, "
+        f"silence={SILENCE_KILL_MIN}min, base_per_clause={BASE_TIMEOUT_MIN_PER_CLAUSE}min, "
+        f"log_grace={LOG_ALIVE_GRACE_SECS}s)"
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(CHECK_INTERVAL)
+
+            # Sponsor heartbeats for alive workers (legacy)
+            await pool.send_sponsor_heartbeats()
+
+            # NST.82.3 — per-worker silence + total kill
+            await _check_workers_for_kill()
+
+            # Ghost claim recovery — find tasks claimed in DB but no local worker
+            from poller import reconcile_ghost_claims
+            await reconcile_ghost_claims()
+
+        except asyncio.CancelledError:
+            logger.info("Watchdog cancelled — exiting cleanly")
+            return
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+
+
+def _log_mtime_age(logfile: str) -> float:
+    """Seconds since the log file was last modified. Returns inf if no file."""
+    if not logfile:
+        return float("inf")
+    try:
+        return time.time() - os.path.getmtime(logfile)
+    except (OSError, FileNotFoundError):
+        return float("inf")
+
+
+def _tail_log(logfile: str, lines: int = 100) -> str:
+    """Read last N lines from a log file. Returns empty string on failure."""
+    if not logfile or not os.path.exists(logfile):
+        return ""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["tail", "-n", str(lines), logfile],
+            capture_output=True, text=True, timeout=5
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+async def _save_log_to_dispatch(task_id: str, log_tail: str, kill_reason: str):
+    """Save the last log lines to dispatch_queue.result_metadata for post-mortem."""
+    if not task_id or not log_tail:
+        return
+    try:
+        metadata = json.dumps({
+            "kill_reason": kill_reason,
+            "log_tail_lines": 100,
+            "log_tail": log_tail[-8000:],  # Cap at 8KB
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        await pool._nous_post_with_response("/dispatch/update-metadata", {
+            "task_id": task_id,
+            "result_metadata": metadata,
+        })
+    except Exception as e:
+        logger.error(f"Failed to save log to dispatch: {e}")
+        # Fallback: try direct Supabase REST
+        try:
+            import httpx
+            sb_url = os.environ.get("SUPABASE_URL", "https://oozlawunlkkuaykfunan.supabase.co")
+            sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+            if sb_key:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.patch(
+                        f"{sb_url}/rest/v1/dispatch_queue?id=eq.{task_id}",
+                        headers={
+                            "apikey": sb_key,
+                            "Authorization": f"Bearer {sb_key}",
+                            "Content-Profile": "nous",
+                            "Content-Type": "application/json",
+                        },
+                        json={"result_metadata": json.loads(metadata)},
+                    )
+        except Exception as e2:
+            logger.error(f"Fallback log save also failed: {e2}")
+
+
+async def _check_workers_for_kill():
+    """NST.82.3 — per-worker kill: silence (no event > N min) or total elapsed > scaled timeout.
+
+    v3.1: Also checks log file mtime. If log is growing (Claude Code writing output),
+    worker is alive even without explicit /progress POSTs. Only kill when BOTH
+    progress events AND log output have gone silent.
+    """
+    for w in pool.list_workers():
+        name = w.get("name", "unknown")
+        progress = w.get("progress", 0)
+        if progress >= 100:
+            continue  # worker is done; spawner watcher will clean up
+
+        silence_secs = w.get("progress_age_secs", 0)
+        running_mins = w.get("running_mins", 0)
+        clause_count = w.get("clause_count", 1)
+        silence_kill_secs = w.get("silence_kill_secs", SILENCE_KILL_MIN * 60)
+        total_timeout_min = w.get("total_timeout_min", clause_count * BASE_TIMEOUT_MIN_PER_CLAUSE)
+        logfile = w.get("logfile", "")
+
+        # v3.1: Check log file mtime as secondary liveness signal
+        log_age = _log_mtime_age(logfile)
+        log_alive = log_age < LOG_ALIVE_GRACE_SECS
+
+        if log_alive:
+            # Log is growing — Claude Code is actively writing output.
+            # Don't kill on silence alone. Only log a warning.
+            if silence_secs > silence_kill_secs:
+                logger.info(
+                    f"[remora] {name} silence={silence_secs}s>{silence_kill_secs}s "
+                    f"BUT log active (age={int(log_age)}s) — skipping kill"
+                )
+            continue
+
+        kill_reason = None
+        if silence_secs > silence_kill_secs:
+            kill_reason = (
+                f"silence:{silence_secs // 60}min>={silence_kill_secs // 60}min "
+                f"(log_age={int(log_age)}s)"
+            )
+        elif running_mins > total_timeout_min:
+            kill_reason = (
+                f"total:{running_mins}min>{total_timeout_min}min "
+                f"(clause_count={clause_count}, base={BASE_TIMEOUT_MIN_PER_CLAUSE})"
+            )
+
+        if kill_reason:
+            logger.warning(f"[remora] killing {name}: {kill_reason}")
+
+            # v3.1: Capture log tail before killing
+            log_tail = _tail_log(logfile, 100)
+            if log_tail:
+                logger.info(f"[remora] captured {len(log_tail)} chars of log for {name}")
+
+            task_id = pool.get_task_id(name)
+
+            # Save log to dispatch_queue.result_metadata
+            if task_id:
+                await _save_log_to_dispatch(task_id, log_tail, kill_reason)
+
+            await pool.kill_worker(name)
+            await pool._nous_post("/event", {
+                "event_type": "error",
+                "agent_id": name,
+                "agent_type": "claude2",
+                "summary": f"[remora] killed: {kill_reason}",
+            })
+            if task_id:
+                await pool._nous_post("/dispatch/release", {
+                    "task_id": task_id,
+                    "agent_id": name,
+                    "reason": kill_reason,
+                })
+
+
+async def reset_ghost_tasks():
+    """Manual trigger — also calls ghost claim reconciliation."""
+    from poller import reconcile_ghost_claims
+    await reconcile_ghost_claims()
