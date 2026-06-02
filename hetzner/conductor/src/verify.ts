@@ -258,6 +258,32 @@ async function fetchCommittedFiles(dispatch_id: string): Promise<string[] | null
 }
 
 /**
+ * FREE.10 — fetch dispatch_mode + clause_id so handleVerify can skip
+ * freeform/orchestrator dispatches (knowledge work with no clause to verify).
+ * Returns nulls on error so verify falls through to its normal path.
+ */
+async function fetchDispatchMode(
+  dispatch_id: string,
+): Promise<{ dispatch_mode: string | null; clause_id: string | null; bible_clause: string | null }> {
+  // deno-lint-ignore no-explicit-any
+  const sb = getSupabaseClient() as any;
+  try {
+    const { data } = await sb
+      .from("dispatch_queue")
+      .select("dispatch_mode, clause_id, bible_clause")
+      .eq("id", dispatch_id)
+      .maybeSingle();
+    return {
+      dispatch_mode: data?.dispatch_mode ?? null,
+      clause_id: data?.clause_id ?? null,
+      bible_clause: data?.bible_clause ?? null,
+    };
+  } catch {
+    return { dispatch_mode: null, clause_id: null, bible_clause: null };
+  }
+}
+
+/**
  * Scope a full repo compare to only the files this dispatch touched.
  * If committedFiles is null (pre-column dispatches), returns the
  * original compare unmodified for backward compatibility.
@@ -611,6 +637,24 @@ export async function handleVerify(req: Request): Promise<Response> {
 
   const parsed = parseBody(raw);
   if ("error" in parsed) return jsonResponse(parsed, 400);
+
+  // FREE.10 — defensive skip for freeform/orchestrator dispatches.
+  // These are knowledge work with no clause/AC to verify; sweeping them
+  // through the sentinel pipeline would mark successful artifact-producing
+  // runs as verify_failed. Also covers the missing-clause edge.
+  const dispatchInfo = await fetchDispatchMode(parsed.dispatch_id);
+  if (
+    dispatchInfo.dispatch_mode === "freeform" ||
+    dispatchInfo.dispatch_mode === "orchestrator" ||
+    (!dispatchInfo.clause_id && !dispatchInfo.bible_clause)
+  ) {
+    return jsonResponse({
+      ok: true,
+      outcome: "skipped",
+      reason: "freeform_no_verify",
+      status: "complete",
+    });
+  }
 
   const startedAt = Date.now();
   // AC#9 audit trail: org_id, triggered_by_agent_id, session_id, parent_run_id, fuse_id.

@@ -52,8 +52,9 @@ async function handleBatchVerify(req: Request): Promise<Response> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data: pending, error: qErr } = await (sb as any)
     .from("dispatch_queue")
-    .select("id, clause_id, status, agent_id")
+    .select("id, clause_id, status, agent_id, dispatch_mode")
     .in("status", ["complete", "done"])
+    .not("dispatch_mode", "in", "(freeform,orchestrator)")
     .order("updated_at", { ascending: true })
     .limit(limit);
   if (qErr) return jsonResponse({ error: "query_failed", detail: qErr.message }, 500);
