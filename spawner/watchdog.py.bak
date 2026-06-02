@@ -1,0 +1,75 @@
+"""Heartbeat monitoring + ghost task cleanup. NST.82.3: per-worker silence + total kill."""
+import asyncio
+import logging
+import time
+from config import NOUS_URL, NOUS_KEY, SILENCE_KILL_MIN, BASE_TIMEOUT_MIN_PER_CLAUSE
+import pool
+
+logger = logging.getLogger("spawner.watchdog")
+
+CHECK_INTERVAL = 60  # NST.82.3: check every minute (was 5min — finer for silence kill)
+
+
+async def run():
+    """Main watchdog loop. Runs until cancelled."""
+    logger.info(
+        f"Watchdog started (interval={CHECK_INTERVAL}s, "
+        f"silence={SILENCE_KILL_MIN}min, base_per_clause={BASE_TIMEOUT_MIN_PER_CLAUSE}min)"
+    )
+
+    while True:
+        try:
+            await asyncio.sleep(CHECK_INTERVAL)
+
+            # Sponsor heartbeats for alive workers (legacy)
+            await pool.send_sponsor_heartbeats()
+
+            # NST.82.3 — per-worker silence + total kill
+            await _check_workers_for_kill()
+
+        except asyncio.CancelledError:
+            logger.info("Watchdog cancelled — exiting cleanly")
+            return
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+
+
+async def _check_workers_for_kill():
+    """NST.82.3 — per-worker kill: silence (no event > N min) or total elapsed > scaled timeout."""
+    for w in pool.list_workers():
+        name = w.get("name", "unknown")
+        progress = w.get("progress", 0)
+        if progress >= 100:
+            continue  # worker is done; spawner watcher will clean up
+
+        silence_secs = w.get("progress_age_secs", 0)
+        running_mins = w.get("running_mins", 0)
+        clause_count = w.get("clause_count", 1)
+        silence_kill_secs = w.get("silence_kill_secs", SILENCE_KILL_MIN * 60)
+        total_timeout_min = w.get("total_timeout_min", clause_count * BASE_TIMEOUT_MIN_PER_CLAUSE)
+
+        kill_reason = None
+        if silence_secs > silence_kill_secs:
+            kill_reason = f"silence:{silence_secs // 60}min>={silence_kill_secs // 60}min"
+        elif running_mins > total_timeout_min:
+            kill_reason = (
+                f"total:{running_mins}min>{total_timeout_min}min "
+                f"(clause_count={clause_count}, base={BASE_TIMEOUT_MIN_PER_CLAUSE})"
+            )
+
+        if kill_reason:
+            logger.warning(f"[remora] killing {name}: {kill_reason}")
+            await pool.kill_worker(name)
+            await pool._nous_post("/event", {
+                "event_type": "error",
+                "agent_id": name,
+                "agent_type": "claude2",
+                "summary": f"[remora] killed: {kill_reason}",
+            })
+            task_id = pool.get_task_id(name) if hasattr(pool, "get_task_id") else None
+            if task_id:
+                await pool._nous_post("/dispatch/release", {
+                    "task_id": task_id,
+                    "agent_id": name,
+                    "reason": kill_reason,
+                })
