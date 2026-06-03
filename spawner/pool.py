@@ -214,11 +214,16 @@ Suggested milestones:
   50% — core logic done
   70% — deployed / pushed
   85% — QA / verification
-  100% — DONE file written, dispatch closed
 
+DO NOT fire a 100% progress event. The complete event below IS the 100% signal.
+After 85%, go straight to closing the task.
 If you don't report progress, the spawner assumes you're stuck after 10 minutes.
 
 ### Closing the Task — MANDATORY. DO NOT SKIP.
+The complete event MUST be the absolute LAST thing you fire. No progress events,
+no memory saves, no inbox posts AFTER complete. Anything after complete causes
+the Fleet board to show you as stale.
+
 When done, you MUST close the dispatch:
 ```bash
 curl -s -X POST {NOUS_URL}/dispatch/complete \\
