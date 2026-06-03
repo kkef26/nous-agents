@@ -30,21 +30,7 @@ nous-agents/
 │   │   ├── ecosystem.config.js ← PM2 config (port, env vars)
 │   │   ├── tsconfig.json
 │   │   └── package.json
-│   └── conductor/              ← Conductor service (:8791)
-│       ├── src/
-│       │   ├── index.ts        ← Express server
-│       │   ├── verify.ts       ← Verify mode (6 checks + Sentinel)
-│       │   ├── merge.ts        ← Merge staging→main
-│       │   ├── sentinel.ts     ← Haiku scoring (tests, criticals, coverage, perf)
-│       │   ├── fuse_manager.ts ← Circuit breaker for repeated failures
-│       │   ├── tactical_amend.ts ← Hot-fix amendment flow
-│       │   ├── status.ts
-│       │   ├── shared.ts
-│       │   └── lib/common/     ← Shared helpers
-│       ├── dist/
-│       ├── ecosystem.config.js
-│       ├── tsconfig.json
-│       └── package.json
+│   └── (conductor lives in nous-station/hetzner/conductor-v4/ — not in this repo)
 ├── supabase/
 │   └── functions/              ← DEAD CODE. Legacy Deno edge function stubs.
 │       ├── scoper/             ← NOT deployed. Historical artifact.
@@ -59,21 +45,19 @@ Live services run from `hetzner/`. The `supabase/functions/` directory contains 
 
 ## Shared Helpers (`lib/common/`)
 
-Both scoper and conductor have a `lib/common/` directory with identical helper modules:
+Scoper has a `lib/common/` directory with helper modules:
 
 | File | Purpose |
 |------|---------|
 | `db.ts` | `getSupabaseClient()` — singleton Supabase client |
 | `github.ts` | GitHub API helpers (contents, commits, refs) |
-| `logging.ts` | `writeScoperStep()` / `writeConductorStep()` — structured step logging |
+| `logging.ts` | `writeScoperStep()` — structured step logging |
 | `audit_trail.ts` | `resolveAuditTrail()` — extract agent/session/org from request |
 | `loop_guard.ts` | Dedup + hourly cap for loop prevention |
 | `cost.ts` | Token → cost calculation |
 | `types.ts` | Shared type definitions |
 | `vercel.ts` | Vercel deploy helpers |
-| `source_material.ts` | (scoper only) `loadFeatureSourceMaterial()` query helper |
-
-When adding a helper used by both services, add it to both `lib/common/` directories. These are NOT symlinked — they're independent copies. Keep them in sync manually.
+| `source_material.ts` | `loadFeatureSourceMaterial()` query helper |
 
 ## Service Ports
 
@@ -82,7 +66,6 @@ When adding a helper used by both services, add it to both `lib/common/` directo
 | station-proxy | 8095 | Python (FastAPI) — LLM gateway |
 | spawner | 8787 | Python (FastAPI) — worker dispatch |
 | scoper | 8790 | Node.js (Express) — plan/replan |
-| conductor | 8791 | Node.js (Express) — verify/merge |
 
 ## Express Handler Pattern
 
@@ -124,9 +107,6 @@ import { getSupabaseClient } from "./lib/common/db";
 | Scoper plan mode | `plan.ts`, `decomposition.ts`, `prerequisites.ts`, `waves.ts`, `alignment_gate.ts` | `_shared.ts`, `lib/common/*` |
 | Scoper replan | `replan.ts` | `plan.ts` (reuses `runPlan`), `_shared.ts` |
 | Scoper infra | `index.ts`, `status.ts`, `deploy.ts` | `_shared.ts` |
-| Conductor verify | `verify.ts`, `sentinel.ts` | `shared.ts`, `lib/common/*` |
-| Conductor merge | `merge.ts`, `fuse_manager.ts` | `shared.ts`, `lib/common/*` |
-| Conductor infra | `index.ts`, `status.ts` | `shared.ts` |
 
 ## Environment Variables
 
@@ -137,7 +117,7 @@ SUPABASE_URL          — https://oozlawunlkkuaykfunan.supabase.co
 SUPABASE_SERVICE_ROLE_KEY — (from Supabase dashboard)
 STATION_PROXY_URL     — http://127.0.0.1:8095
 NOUS_API_KEY          — (for self-deploy and dispatch calls)
-SCOPER_PORT / CONDUCTOR_PORT — port binding
+SCOPER_PORT           — port binding
 ```
 
 ## Deploy Flow
