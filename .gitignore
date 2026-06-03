@@ -11,4 +11,3 @@ dist/
 # Hetzner PM2 config (env vars, not in git)
 hetzner/*/ecosystem.config.js
 hetzner/scoper/ecosystem.config.js
-hetzner/conductor/ecosystem.config.js
