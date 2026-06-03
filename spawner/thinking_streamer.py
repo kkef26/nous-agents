@@ -238,11 +238,9 @@ class ThinkingStreamer:
                     if text:
                         self._emit({"type": "error", "content": _trim(text), "ts": ts})
         elif etype == "result":
-            r = ev.get("result")
-            if isinstance(r, str) and r.strip():
-                self._emit({"type": "progress", "percent": 100, "content": _trim(r), "ts": ts})
-            # Signal complete so no further progress events are buffered.
-            # The worker will fire its own complete event to NOUS after this.
+            # Signal complete FIRST — clears buffer and blocks future _emit calls.
+            # The 100% progress is intentionally NOT emitted. The worker's own
+            # complete event to NOUS is the terminal signal Fleet should see.
             self.signal_complete()
 
     def _parse_assistant_block(self, block: dict, ts: str) -> None:
@@ -306,7 +304,7 @@ class ThinkingStreamer:
                 logger.error(f"[thinking] flush loop error {self.agent_id}: {e}")
 
     async def _flush(self) -> None:
-        if not self._buffer:
+        if not self._buffer or self._complete_signaled:
             return
         # NST.GHOST.2 — take a snapshot via slice so a POST failure can restore
         # the original chunks back to the head of _buffer instead of dropping them.
@@ -357,8 +355,9 @@ class ThinkingStreamer:
 
     # ─── Death report ─────────────────────────────────────────────────────
     def signal_complete(self) -> None:
-        """Called by pool when worker fires complete event. Stops buffering."""
+        """Called when result event seen. Stops buffering AND clears pending buffer."""
         self._complete_signaled = True
+        self._buffer.clear()
 
     async def death_report(
         self,
