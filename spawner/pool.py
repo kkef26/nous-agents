@@ -1,15 +1,17 @@
 """Worker lifecycle: spawn, track, kill, reconcile, boot injection, spawner ops."""
 import asyncio
+import glob
 import json
 import os
 import pwd
 import signal
 import time
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import httpx
 from config import NOUS_URL, NOUS_KEY, SPAWNER_INSTANCE, MAX_WORKERS, PORT, SILENCE_KILL_MIN, BASE_TIMEOUT_MIN_PER_CLAUSE
 from thinking_streamer import ThinkingStreamer, classify_cause
+from push_before_die import push_before_die  # NOUS.SALVAGE.2
 
 logger = logging.getLogger("spawner.pool")
 
@@ -443,11 +445,104 @@ async def _watch_completion(session_name: str, process: asyncio.subprocess.Proce
     logger.info(f"Worker {session_name} exited (code={process.returncode})")
 
 
+# ─── NOUS.SALVAGE.2 — progress accessor + repo discovery + kill hook ─────────
+# Hard deadline for the salvage push attempt. Aligned to the worker kill
+# grace period (clause constraint: shutdown must not block indefinitely).
+SALVAGE_DEADLINE_SECS = float(os.environ.get("SALVAGE_DEADLINE_SECS", "30"))
+
+
+def progress_fraction(agent_id: str) -> float:
+    """Synchronous accessor used by the SIGTERM/kill path. Returns 0.0–1.0.
+
+    Mirrors the clause's progressFraction() contract — must not call await
+    because it's invoked from the signal-handler-equivalent path before we
+    decide whether salvage is worthwhile.
+    """
+    entry = _progress.get(agent_id) or {}
+    raw = entry.get("percent")
+    if raw is None:
+        return 0.0
+    try:
+        return max(0.0, min(1.0, float(raw) / 100.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def register_repo_dirs(agent_id: str, paths: List[str]) -> None:
+    """Workers can declare which checkout dirs they own. Used by the kill
+    path to know what to salvage. (Future: surface via HTTP route.)
+    """
+    info = _workers.get(agent_id)
+    if not info:
+        return
+    cur = list(info.get("repo_dirs") or [])
+    for p in paths:
+        if p and p not in cur:
+            cur.append(p)
+    info["repo_dirs"] = cur
+
+
+def discover_repo_dirs(agent_id: str) -> List[str]:
+    """Best-effort: explicit registration first, then a /tmp scan of dirs
+    that look like a worker's git checkout for this agent_id. Dirs whose
+    mtime predates the worker's start are skipped.
+    """
+    info = _workers.get(agent_id) or {}
+    explicit = list(info.get("repo_dirs") or [])
+    if explicit:
+        return explicit
+
+    started = info.get("started", 0)
+    discovered: List[str] = []
+    for pattern in (
+        f"/tmp/{agent_id}*",
+        f"/tmp/*-{agent_id}*",
+        f"/tmp/salvage-{agent_id}/*",
+        f"/tmp/dispatch-{agent_id}*",
+    ):
+        for candidate in glob.glob(pattern):
+            git_dir = os.path.join(candidate, ".git")
+            if not os.path.isdir(git_dir):
+                continue
+            try:
+                if started and os.path.getmtime(candidate) < started - 60:
+                    continue
+            except OSError:
+                continue
+            if candidate not in discovered:
+                discovered.append(candidate)
+    return discovered
+
+
 async def kill_worker(session_name: str, kill_reason: str = None) -> bool:
-    """Kill a worker by session name."""
+    """Kill a worker by session name.
+
+    NOUS.SALVAGE.2: before sending SIGTERM, attempt a push-before-die so
+    work past the salvage milestone threshold lands on a salvage branch.
+    The attempt is hard-bounded by SALVAGE_DEADLINE_SECS so shutdown is
+    never blocked indefinitely. Failures log at WARN — never retried,
+    never raised.
+    """
     info = _workers.get(session_name)
     if not info:
         return False
+
+    try:
+        fraction = progress_fraction(session_name)
+        repos = discover_repo_dirs(session_name)
+        if repos:
+            await push_before_die(
+                agent_id=session_name,
+                task_id=info.get("task_id") or None,
+                repo_dirs=repos,
+                progress_fraction=fraction,
+                nous_url=NOUS_URL,
+                nous_key=NOUS_KEY,
+                deadline_secs=SALVAGE_DEADLINE_SECS,
+            )
+    except Exception as exc:
+        logger.warning("push_before_die failed for %s: %s", session_name, exc)
+
     try:
         os.killpg(os.getpgid(info["pid"]), signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
