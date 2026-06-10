@@ -1,0 +1,15 @@
+{
+  "name": "nous-conductor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Conductor — verdict + merge gatekeeper. v2 lives in supabase/functions/conductor; this module hosts shared client code (e.g. MacGruber push helper).",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test --import tsx dist/tests/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
