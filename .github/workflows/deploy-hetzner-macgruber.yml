@@ -1,0 +1,50 @@
+name: Deploy to Hetzner (macgruber)
+
+# Auto-deploy: any push to main touching apps/macgruber redeploys MacGruber
+# on the Hetzner pipeline box. Requires repo secrets HETZNER_HOST,
+# HETZNER_USER, HETZNER_SSH_PASS (same values as kkef26/nous-scoper).
+on:
+  push:
+    branches: [main]
+    paths: ['apps/macgruber/**']
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-macgruber
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          password: ${{ secrets.HETZNER_SSH_PASS }}
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            mkdir -p /opt/nous/macgruber-src
+            if [ ! -d /opt/nous/macgruber-src/.git ]; then
+              git clone https://github.com/kkef26/nous-agents.git /opt/nous/macgruber-src
+            fi
+            cd /opt/nous/macgruber-src
+            git fetch origin main && git reset --hard origin/main
+            mkdir -p /opt/nous/macgruber
+            rsync -a --delete --exclude node_modules --exclude dist --exclude .env apps/macgruber/ /opt/nous/macgruber/
+            cd /opt/nous/macgruber
+            if [ ! -f .env ]; then
+              echo "FATAL: /opt/nous/macgruber/.env missing — create with DATABASE_URL, GITHUB_TOKEN, DISPATCH_BASE_URL, NOUS_API_KEY"; exit 1
+            fi
+            npm install --no-audit --no-fund
+            npm install dotenv --no-audit --no-fund --save=false
+            npm run build
+            mkdir -p /var/log/macgruber
+            pm2 delete macgruber 2>/dev/null || true
+            pm2 restart macgruber-api macgruber-poller --update-env 2>/dev/null || pm2 start ecosystem.config.js
+            pm2 save
+            sleep 2
+            curl -sf localhost:8792/healthz
+            echo "deployed $(git -C /opt/nous/macgruber-src rev-parse --short HEAD)"
