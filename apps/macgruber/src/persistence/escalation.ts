@@ -61,9 +61,9 @@ export async function writeDecisionQueueEntry(
     return { ok: false, decision_id: null, error: 'intake_event_id missing from payload.context' };
   }
   const errorSummary = `circuit_breaker_exhausted:${breaker.failure_class}:${breaker.attempts}/${breaker.max_attempts}`;
-  try {
+  const insertOnce = async (dispatchId: string | null): Promise<EscalationResult> => {
     const { rows } = await client.query<{ id: string }>(INSERT_DECISION_SQL, [
-      payload.dispatch_id,
+      dispatchId,
       input.agent_id ?? payload.agent_id,
       payload.project,
       payload.bible_clause,
@@ -77,6 +77,20 @@ export async function writeDecisionQueueEntry(
       return { ok: false, decision_id: null, error: 'decision_queue insert returned no rows' };
     }
     return { ok: true, decision_id: rows[0].id };
+  };
+  try {
+    try {
+      return await insertOnce(payload.dispatch_id);
+    } catch (err) {
+      // The dispatch row may have been deleted (supersede sweep) or the id may
+      // be synthetic (poller). The escalation must still land — retry without
+      // the FK linkage; the full context jsonb keeps the dispatch_id.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (payload.dispatch_id && msg.includes('decision_queue_dispatch_id_fkey')) {
+        return await insertOnce(null);
+      }
+      throw err;
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[macgruber] decision_queue insert failed: ${message}\n`);

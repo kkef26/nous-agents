@@ -25,8 +25,8 @@ module.exports = {
         HOST: '127.0.0.1',
         MACGRUBER_PROJECT: 'nous-agents',
       },
-      out_file: '/var/log/macgruber/api.out.log',
-      error_file: '/var/log/macgruber/api.err.log',
+      out_file: '/home/nous/.pm2/logs/macgruber-api.out.log',
+      error_file: '/home/nous/.pm2/logs/macgruber-api.err.log',
     },
     {
       name: 'macgruber-poller',
@@ -41,8 +41,8 @@ module.exports = {
         MACGRUBER_POLLER_LOOKBACK_MINUTES: '60',
         MACGRUBER_POLLER_LIMIT: '50',
       },
-      out_file: '/var/log/macgruber/poller.out.log',
-      error_file: '/var/log/macgruber/poller.err.log',
+      out_file: '/home/nous/.pm2/logs/macgruber-poller.out.log',
+      error_file: '/home/nous/.pm2/logs/macgruber-poller.err.log',
     },
   ],
 };
