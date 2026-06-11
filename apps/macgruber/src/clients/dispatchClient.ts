@@ -62,7 +62,7 @@ export class DispatchClient {
     }
     return {
       tree_run_id: json.tree_run_id,
-      accepted: json.accepted === true,
+      accepted: json.accepted === true || json.ok === true,
     };
   }
 

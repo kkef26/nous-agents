@@ -36,7 +36,7 @@ function mockQueryClient(
 test('pollMissedFailures returns zero counts when no unhandled failures exist', async () => {
   const deps: PollerDeps = {
     db: mockQueryClient([]),
-    intake: buildIntakeDeps(),
+    intakeDepsFor: () => buildIntakeDeps(),
     log: () => {},
   };
   const summary = await pollMissedFailures(deps);
@@ -70,7 +70,7 @@ test('pollMissedFailures processes each unhandled failure via processIntakeEvent
   };
   const deps: PollerDeps = {
     db: mockQueryClient(failures),
-    intake,
+    intakeDepsFor: () => intake,
     log: () => {},
   };
   const summary = await pollMissedFailures(deps);
@@ -83,7 +83,7 @@ test('pollMissedFailures processes each unhandled failure via processIntakeEvent
 test('pollMissedFailures exits with code 1 when the DB query throws', async () => {
   const deps: PollerDeps = {
     db: mockQueryClient(new Error('connection lost')),
-    intake: buildIntakeDeps(),
+    intakeDepsFor: () => buildIntakeDeps(),
     log: () => {},
   };
   const summary = await pollMissedFailures(deps);
@@ -133,7 +133,7 @@ test('pollMissedFailures dedup-skip happens at the SQL boundary, not in JS', asy
   };
   const deps: PollerDeps = {
     db: mockQueryClient(failures),
-    intake,
+    intakeDepsFor: () => intake,
     log: () => {},
   };
   const summary = await pollMissedFailures(deps);

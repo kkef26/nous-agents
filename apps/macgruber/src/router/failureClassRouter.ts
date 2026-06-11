@@ -10,13 +10,9 @@
 import { executeAction, type ExecuteActionDeps } from '../executors/executeAction.js';
 import type { ActionResult, FixAction } from '../executors/types.js';
 
-export type FailureClass =
-  | 'compile_error'
-  | 'test_failure'
-  | 'deploy_timeout'
-  | 'merge_conflict'
-  | 'stale_branch'
-  | 'unknown';
+import type { FailureClass } from '../contract/intakeContract.js';
+
+export type { FailureClass };
 
 export interface FixStrategy {
   failure_class: FailureClass;

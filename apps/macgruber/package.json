@@ -1,20 +1,23 @@
 {
   "name": "macgruber",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "MacGruber — universal pipeline failure handler (FEAT.MACGRUBER feature group)",
-  "main": "dist/server.js",
+  "description": "MacGruber v2 — mechanical pipeline failure handler (single implementation; legacy macgruber/ removed 2026-06-11)",
+  "main": "dist/src/server.js",
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
-    "start": "node dist/server.js",
-    "start:poller": "node dist/poller/pollMissedFailures.js",
-    "test": "node --test --experimental-test-module-mocks --import tsx/esm tests/**/*.test.ts"
+    "start": "node dist/src/server.js",
+    "start:poller": "node dist/src/poller/run.js",
+    "test": "node --test --import tsx/esm tests/**/*.test.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "pg": "^8.11.5"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.6",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"
   }

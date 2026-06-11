@@ -64,5 +64,5 @@ export interface DecisionQueuePayload {
   bible_clause: string | null;
   question: string;
   context: InvestigationReport & { intake_event_id: string };
-  urgency: 'low' | 'normal' | 'high';
+  urgency: 'blocking' | 'advisory';
 }

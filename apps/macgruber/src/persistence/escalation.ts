@@ -37,7 +37,7 @@ const INSERT_DECISION_SQL = `
     escalated_at,
     created_at,
     updated_at
-  ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, now(), now(), now())
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, now(), now(), now())
   RETURNING id
 `;
 
@@ -88,7 +88,7 @@ export function buildInvestigationPayload(input: {
   report: InvestigationReport;
   agent_id: string;
   dispatch_id: string | null;
-  urgency?: 'low' | 'normal' | 'high';
+  urgency?: 'blocking' | 'advisory';
 }): DecisionQueuePayload {
   return {
     dispatch_id: input.dispatch_id,
@@ -97,6 +97,6 @@ export function buildInvestigationPayload(input: {
     bible_clause: input.report.clause_id,
     question: `macgruber circuit breaker exhausted for failure_class=${input.report.failure_class}. Manual review required.`,
     context: input.report,
-    urgency: input.urgency ?? 'high',
+    urgency: input.urgency ?? 'blocking',
   };
 }

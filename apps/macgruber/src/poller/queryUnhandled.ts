@@ -43,7 +43,7 @@ const QUERY_SQL = `
       de.detail AS detail
     FROM nous.dispatch_events de
     JOIN nous.dispatch_queue dq ON dq.id = de.dispatch_id
-    WHERE de.event_type IN ('fail', 'failure', 'error')
+    WHERE de.event_type IN ('fail', 'failure', 'error', 'failed')
       AND de.created_at >= now() - ($1 || ' minutes')::interval
       AND ($2::text IS NULL OR dq.project = $2)
   ),

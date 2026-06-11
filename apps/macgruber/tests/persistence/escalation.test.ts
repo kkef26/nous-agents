@@ -56,7 +56,7 @@ test('buildInvestigationPayload preserves intake_event_id and clause linkage', (
   });
   assert.equal(payload.context.intake_event_id, 'intake-1');
   assert.equal(payload.bible_clause, 'FEAT.MACGRUBER.6');
-  assert.equal(payload.urgency, 'high');
+  assert.equal(payload.urgency, 'blocking');
   assert.equal(payload.agent_id, 'macgruber-svc');
   assert.equal(payload.dispatch_id, 'disp-1');
 });
@@ -82,7 +82,7 @@ test('writeDecisionQueueEntry inserts a row with the full report in context', as
   assert.equal(params[3], 'FEAT.MACGRUBER.6');
   const contextJson = JSON.parse(params[5] as string) as InvestigationReport;
   assert.equal(contextJson.intake_event_id, 'intake-1');
-  assert.equal(params[6], 'high');
+  assert.equal(params[6], 'blocking');
   assert.match(params[8] as string, /^circuit_breaker_exhausted:compile_error:2\/2$/);
 });
 

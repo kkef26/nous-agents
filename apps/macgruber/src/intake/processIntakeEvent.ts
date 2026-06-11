@@ -45,6 +45,7 @@ export async function processIntakeEvent(
     project: event.project,
     dispatch_id: event.dispatch_id,
     agent_id: deps.agent_id,
+    failure_class: event.failure_class,
   };
   try {
     const outcome = await runRemediationLoop(context, deps.remediation);

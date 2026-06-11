@@ -27,6 +27,8 @@ export interface RemediationContext {
   project: string;
   dispatch_id: string | null;
   agent_id: string;
+  /** Failure class from the intake event — drives strategy selection. */
+  failure_class: string;
 }
 
 export interface RemediationDeps {

@@ -1,17 +1,20 @@
-// ecosystem.config.js — MacGruber PM2 configuration
+// ecosystem.config.js — MacGruber v2 PM2 configuration
 //
 // Two fully-independent processes:
-//   macgruber-api    — long-running HTTP service on port :8792
+//   macgruber-api    — long-running HTTP service on 127.0.0.1:8792
 //   macgruber-poller — cron-restarted fallback that catches missed failures
 //
-// The poller process owns NO shared state with the API. A crash on either
-// side does not affect the other (per FEAT.MACGRUBER.9 D9 constraint).
+// Required env (via /opt/nous/macgruber/.env, loaded with -r dotenv/config):
+//   DATABASE_URL        — Supabase Postgres connection string
+//   GITHUB_TOKEN        — PAT for read-only branch/commit/PR checks
+//   DISPATCH_BASE_URL   — https://oozlawunlkkuaykfunan.supabase.co/functions/v1/nous
+//   NOUS_API_KEY        — x-api-key for dispatch cancel/retrigger
 
 module.exports = {
   apps: [
     {
       name: 'macgruber-api',
-      script: 'dist/server.js',
+      script: 'dist/src/server.js',
       node_args: '-r dotenv/config',
       cwd: '/opt/nous/macgruber',
       autorestart: true,
@@ -19,6 +22,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         MACGRUBER_PORT: '8792',
+        HOST: '127.0.0.1',
         MACGRUBER_PROJECT: 'nous-agents',
       },
       out_file: '/var/log/macgruber/api.out.log',
@@ -26,7 +30,7 @@ module.exports = {
     },
     {
       name: 'macgruber-poller',
-      script: 'dist/poller/pollMissedFailures.js',
+      script: 'dist/src/poller/run.js',
       node_args: '-r dotenv/config',
       cwd: '/opt/nous/macgruber',
       autorestart: false,

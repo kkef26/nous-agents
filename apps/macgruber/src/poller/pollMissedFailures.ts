@@ -17,7 +17,8 @@ import type { ParamQueryClient } from '../lib/db.js';
 
 export interface PollerDeps {
   db: ParamQueryClient;
-  intake: ProcessIntakeDeps;
+  /** Per-event deps factory — keeps fix_registry attribution per clause/run. */
+  intakeDepsFor: (event: IntakeEvent) => ProcessIntakeDeps;
   options?: {
     limit?: number;
     lookbackMinutes?: number;
@@ -55,7 +56,7 @@ export async function pollMissedFailures(deps: PollerDeps): Promise<PollerSummar
   for (const failure of failures) {
     const event = toIntakeEvent(failure);
     try {
-      const result = await processIntakeEvent(event, deps.intake);
+      const result = await processIntakeEvent(event, deps.intakeDepsFor(event));
       if (result.ok) processed++;
       else failed++;
     } catch (err) {
