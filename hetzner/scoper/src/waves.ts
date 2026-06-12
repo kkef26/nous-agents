@@ -8,6 +8,7 @@
 // requires, enables, critical_path).
 
 import type { ClauseSpec } from "./decomposition.js";
+import { injectIngestionGates } from "./gates/ingestion_gate.js";
 
 export interface Wave {
   index: number;                 // 0-based wave number
@@ -114,12 +115,21 @@ export function organizeWaves(featureId: string, clauses: ClauseSpec[]): WaveOrg
     };
   }
 
-  const waves = layerByDAG(clauses);
+  // NOUS.IDLOCK.6: ingestion-before-graph wave gate. Inject every ingestion
+  // clause as a hard `requires` for every graph/read clause in this feature
+  // batch BEFORE running the DAG layering. Without this, AXO.26 incident:
+  // graph endpoints ran in wave 2 with no gate on data landing, so queries
+  // hit empty tables. layerByDAG honours requires[] when computing waves, so
+  // updating requires here is sufficient to push graph/read into a later wave.
+  const gated = injectIngestionGates(clauses);
+  const gatedClauses = gated.clauses as ClauseSpec[];
+
+  const waves = layerByDAG(gatedClauses);
 
   // Stamp sequence_order (1-based, monotonic across waves) and
   // parallel_safe_with (sibling clause_ids in the same wave) onto each clause.
   // priority_rank is a per-feature 1-based rank across all clauses, WSJF-sorted.
-  const wsjfRanked = [...clauses].sort((a, b) => {
+  const wsjfRanked = [...gatedClauses].sort((a, b) => {
     if (a.critical_path !== b.critical_path) return a.critical_path ? -1 : 1;
     return wsjfScore(b) - wsjfScore(a);
   });
@@ -130,7 +140,7 @@ export function organizeWaves(featureId: string, clauses: ClauseSpec[]): WaveOrg
   let seq = 0;
   for (const wave of waves) {
     for (const cid of wave.clause_ids) {
-      const c = clauses.find((x) => x.id === cid);
+      const c = gatedClauses.find((x) => x.id === cid);
       if (!c) continue;
       seq += 1;
       stamped.push({
