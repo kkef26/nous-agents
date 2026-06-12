@@ -22,6 +22,7 @@ import { loadFeatureSourceMaterial } from "./lib/common/source_material.js";
 import yaml from "js-yaml";
 import type { FeatureSourceMaterial, SourceMaterialRow } from "./lib/common/source_material.js";
 import { MOLD_SIZE, emitPipelineEvent } from "./_shared.js";
+import { allocateClauseIds, AllocatorUnavailableError } from "./allocator.js";
 
 // ─── Public interfaces (unchanged — plan.ts depends on these) ───────────────
 
@@ -76,7 +77,7 @@ export interface DecompositionOutput {
 
 // ─── Internal types ─────────────────────────────────────────────────────────
 
-interface BibleClauseRow {
+export interface BibleClauseRow {
   id: string;
   prefix: string;
   parent_id: string[] | null;
@@ -289,6 +290,35 @@ function draftCustomerExperience(featureName: string | undefined, description: s
     return `When ${name} is shipped, the customer experiences: ${desc}`;
   }
   return `When ${name} is shipped, the customer experiences the outcome stated in the feature spec.`;
+}
+
+/**
+ * NOUS.IDLOCK.5 — Feature-ID alignment guard (pure helper).
+ *
+ * Filters bible_clauses rows so only those whose feature_id matches the planning
+ * feature (or is NULL — un-claimed legacy row) survive enrichment. AXO.26
+ * incident: when an ID collision sent a foreign row into the enrich batch,
+ * Scoper silently rewrote another feature's clause. The guard makes the skip
+ * loud (console.warn per row) and returns the skipped set so callers can emit
+ * a structured pipeline_event.
+ *
+ * Exported for unit testing.
+ */
+export function applyAlignmentGuard(
+  rows: BibleClauseRow[],
+  planningFeatureId: string,
+): { kept: BibleClauseRow[]; skipped: Array<{ clause_id: string; row_feature_id: string | null }> } {
+  const kept: BibleClauseRow[] = [];
+  const skipped: Array<{ clause_id: string; row_feature_id: string | null }> = [];
+  for (const r of rows) {
+    if (r.feature_id !== null && r.feature_id !== planningFeatureId) {
+      skipped.push({ clause_id: r.id, row_feature_id: r.feature_id });
+      console.warn(`[scoper] alignment guard: skipping clause ${r.id} — row.feature_id=${r.feature_id} ≠ planning ${planningFeatureId}`);
+      continue;
+    }
+    kept.push(r);
+  }
+  return { kept, skipped };
 }
 
 function derivePreconditions(clauseRows: BibleClauseRow[]): string[] {
@@ -847,10 +877,91 @@ async function generateClausesFromSource(
     };
   }
 
+  // ─── Phase 1b: Allocate real clause IDs via nous.allocate_clause_ids ──────
+  // NOUS.IDLOCK.5: the skeleton LLM produces stub IDs locally (PREFIX.1..N)
+  // for in-batch reference, but these are NOT authoritative. Mint real IDs
+  // from the DB allocator (advisory-lock, full ID-space scan including
+  // shipped/retired tombstones) and rewrite every stub id + requires + enables
+  // reference to use the allocated IDs.
+  //
+  // Per clause body: allocator unavailability is a FATAL halt — there is no
+  // local fallback by design.
+  let allocation: Awaited<ReturnType<typeof allocateClauseIds>>;
+  try {
+    allocation = await allocateClauseIds(featureId, prefix, skeleton.stubs.length);
+  } catch (err) {
+    await emitPipelineEvent({
+      feature_id: featureId, project: projectTag,
+      event_type: "scoper.allocator.unavailable", agent: "scoper", severity: "error",
+      detail_jsonb: {
+        error: (err as Error).message,
+        requested_count: skeleton.stubs.length,
+        prefix,
+      },
+    });
+    throw err;
+  }
+
+  const idMap = new Map<string, string>();
+  const usableStubs: ClauseStub[] = [];
+  const skippedPlaceholders: Array<{ stub_id: string; allocated_id: string; reason?: string }> = [];
+  for (let i = 0; i < skeleton.stubs.length; i++) {
+    const stub = skeleton.stubs[i];
+    const slot = allocation.slots[i];
+    if (!slot) {
+      // Allocator returned fewer slots than requested — surface as fatal.
+      throw new AllocatorUnavailableError(
+        `requested ${skeleton.stubs.length} IDs, got ${allocation.slots.length}`,
+      );
+    }
+    if (slot.is_placeholder) {
+      skippedPlaceholders.push({ stub_id: stub.id, allocated_id: slot.id, reason: slot.reason });
+      continue;
+    }
+    idMap.set(stub.id, slot.id);
+    usableStubs.push(stub);
+  }
+
+  if (skippedPlaceholders.length > 0) {
+    console.warn(`[scoper] allocator returned ${skippedPlaceholders.length} placeholder slot(s) — skipping`);
+    await emitPipelineEvent({
+      feature_id: featureId, project: projectTag,
+      event_type: "scoper.allocator.placeholders_skipped", agent: "scoper", severity: "warn",
+      detail_jsonb: { skipped: skippedPlaceholders },
+    });
+  }
+
+  // Rewrite every stub id + dependency reference to use allocated IDs.
+  // Internal references that target a skipped (placeholder) stub are dropped
+  // from requires/enables — the dependency never made it into the dispatch tree.
+  const remappedStubs: ClauseStub[] = usableStubs.map((s) => ({
+    ...s,
+    id: idMap.get(s.id)!,
+    requires: (s.requires ?? []).map((r) => idMap.get(r)).filter((r): r is string => !!r),
+    enables: (s.enables ?? []).map((e) => idMap.get(e)).filter((e): e is string => !!e),
+  }));
+
+  if (remappedStubs.length === 0) {
+    await emitPipelineEvent({
+      feature_id: featureId, project: projectTag,
+      event_type: "scoper.allocator.all_placeholders", agent: "scoper", severity: "warn",
+      detail_jsonb: { requested: skeleton.stubs.length },
+    });
+    return {
+      customer_experience: skeleton.customer_experience || draftCustomerExperience(featureName, description),
+      preconditions: [],
+      clauses: [],
+      generated: true,
+      tokens_in: totalTokensIn,
+      tokens_out: totalTokensOut,
+      cost_usd: totalCost,
+    };
+  }
+
   // ─── Phase 2: Batched enrichment (injection mold) ─────────────────────────
   const batches: ClauseStub[][] = [];
-  for (let i = 0; i < skeleton.stubs.length; i += MOLD_SIZE) {
-    batches.push(skeleton.stubs.slice(i, i + MOLD_SIZE));
+  for (let i = 0; i < remappedStubs.length; i += MOLD_SIZE) {
+    batches.push(remappedStubs.slice(i, i + MOLD_SIZE));
   }
 
   const allClauses: ClauseSpec[] = [];
@@ -862,7 +973,7 @@ async function generateClausesFromSource(
       const result = await callBatchEnrichLLM(
         sourceContext,
         batch,
-        skeleton.stubs,
+        remappedStubs,
         previouslyEnriched,
         bi,
         batches.length,
@@ -1040,7 +1151,20 @@ async function enrichExistingClauses(
     .select("id, prefix, parent_id, feature_id, sequence_order, maturity_stage, status, clause_type, critical_path, requires, enables, acceptance_criteria, body, frontmatter, contract")
     .in("id", clauseIds);
   if (error) throw new Error(`decomposition.enrichExistingClauses: ${error.message}`);
-  const rows = (data ?? []) as BibleClauseRow[];
+  const allRows = (data ?? []) as BibleClauseRow[];
+
+  // NOUS.IDLOCK.5: Feature-ID alignment guard. Foreign rows are filtered here;
+  // applyAlignmentGuard logs the structured warning so the helper stays pure
+  // and unit-testable.
+  const { kept: rows, skipped: aligned_skipped } = applyAlignmentGuard(allRows, featureId);
+  if (aligned_skipped.length > 0 && opts?.projectTag) {
+    await emitPipelineEvent({
+      feature_id: featureId, project: opts.projectTag,
+      event_type: "scoper.alignment.feature_id_mismatch", agent: "scoper", severity: "warn",
+      detail_jsonb: { skipped_clauses: aligned_skipped, planning_feature_id: featureId },
+    });
+  }
+
   const preconditions = derivePreconditions(rows);
 
   let llmCustomerExperience: string | null = null;
