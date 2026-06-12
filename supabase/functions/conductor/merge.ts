@@ -24,6 +24,17 @@ import { getDeploymentBySha } from "../_common/vercel.ts";
 import { writeConductorStep } from "../_common/logging.ts";
 import { createFuse } from "./fuse_manager.ts";
 import type { AuditTrail } from "../_common/types.ts";
+// NOUS.FGCONTRACT.4 — physical verification gate must run before any clause
+// flips to shipped. Adapters wire the gate's pure interface to the live
+// Supabase + GitHub clients.
+import {
+  parseContractVerification,
+  runPhysicalVerificationGate,
+  type GateDependencies,
+  type GitReachabilityClient,
+  type SqlExecutor,
+} from "./verificationGate.ts";
+import { insertPhysicalGateFriction } from "./frictions.ts";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -209,21 +220,103 @@ async function verifyProductionUrl(url: string): Promise<{ ok: boolean; status: 
   }
 }
 
+// NOUS.FGCONTRACT.4 — SqlExecutor adapter for the verification gate.
+// Routes probe SQL through the `nous.execute_verification_probe(p_sql)` RPC.
+// The RPC is intentionally narrow — it runs the SQL with read-only privileges
+// and returns rows-or-error. If the RPC is absent (function not deployed), the
+// adapter surfaces the error and the gate fails closed, which is the safe
+// default for an unconfigured verification surface.
+function makeSqlExecutor(): SqlExecutor {
+  return {
+    async execute(sql: string) {
+      try {
+        // deno-lint-ignore no-explicit-any
+        const sb: any = getSupabaseClient();
+        const res = await sb.rpc("execute_verification_probe", { p_sql: sql });
+        if (res?.error) {
+          return { rows: [], error: res.error.message };
+        }
+        const data = res?.data;
+        if (Array.isArray(data)) return { rows: data };
+        if (data == null) return { rows: [] };
+        // Single-value or scalar — wrap so the gate sees a non-empty result.
+        return { rows: [data] };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { rows: [], error: msg };
+      }
+    },
+  };
+}
+
+// GitReachabilityClient adapter — single-shot only (no retry inside the gate).
+// Always anchors on main HEAD (constraint: never staging, never feature branch).
+function makeGitClient(): GitReachabilityClient {
+  return {
+    async isReachableFromMain(repo: string, sha: string) {
+      const slash = repo.indexOf("/");
+      if (slash < 1 || slash === repo.length - 1) {
+        return { reachable: false, main_head: null, error: `bad repo: ${repo}` };
+      }
+      const owner = repo.slice(0, slash);
+      const name = repo.slice(slash + 1);
+      try {
+        // base = main, head = sha. A reachable sha returns status='behind' or
+        // 'identical' (sha is on or before main HEAD). 'ahead' / 'diverged'
+        // means sha is NOT part of main's lineage.
+        const cmp = await compareCommits(owner, name, "main", sha);
+        // deno-lint-ignore no-explicit-any
+        const status = (cmp as any)?.status;
+        // deno-lint-ignore no-explicit-any
+        const mergeBase = (cmp as any)?.merge_base_commit?.sha ?? null;
+        const reachable = status === "behind" || status === "identical" ||
+          (typeof mergeBase === "string" && mergeBase === sha);
+        return {
+          reachable,
+          main_head: typeof (cmp as { base_commit?: { sha?: string } } | undefined)
+            ?.base_commit?.sha === "string"
+            ? (cmp as { base_commit: { sha: string } }).base_commit.sha
+            : null,
+          // deno-lint-ignore no-explicit-any
+          ahead_by: (cmp as any)?.ahead_by,
+          // deno-lint-ignore no-explicit-any
+          behind_by: (cmp as any)?.behind_by,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { reachable: false, main_head: null, error: msg };
+      }
+    },
+  };
+}
+
+function makeGateDeps(): GateDependencies {
+  return { sql: makeSqlExecutor(), git: makeGitClient() };
+}
+
 async function stampShippedAndEmit(
   clauseIds: string[],
   mergeSha: string,
   project: string,
   audit: AuditTrail,
+  // Test seam: override the gate's adapters. Production callers omit.
+  gateDepsOverride?: GateDependencies,
 ): Promise<void> {
   if (clauseIds.length === 0) return;
   const sb = getSupabaseClient();
+  const gateDeps = gateDepsOverride ?? makeGateDeps();
 
-  // shipped_in is a text[] — append the SHA per clause. Read-then-write so we
-  // don't drop any prior shipped entries.
+  // NOUS.FGCONTRACT.4: ONLY route through the verification gate. Clauses
+  // that fail the gate stay at status='build_complete'; the merge SHA is
+  // still appended to shipped_in for forensic record, but status does NOT
+  // flip to 'shipped' without physical proof.
+  const shipped: string[] = [];
+  const heldByGate: string[] = [];
   for (const cid of clauseIds) {
     const { data: row, error: readErr } = await sb
       .from("bible_clauses")
-      .select("shipped_in")
+      // deno-lint-ignore no-explicit-any
+      .select("shipped_in, contract, target_repo" as any)
       .eq("id", cid)
       .maybeSingle();
     if (readErr) {
@@ -236,27 +329,85 @@ async function stampShippedAndEmit(
     );
     const next = prior.includes(mergeSha) ? prior : [...prior, mergeSha];
 
+    // ─── NOUS.FGCONTRACT.4 gate ─────────────────────────────────────────
+    const contract = (row as { contract?: Record<string, unknown> | null }).contract ?? null;
+    const probes = parseContractVerification(
+      contract && typeof contract === "object" ? contract.verification : null,
+    );
+    const targetRepo = (row as { target_repo?: string | null }).target_repo ?? "";
+    const gateRes = await runPhysicalVerificationGate(
+      {
+        id: cid,
+        probes,
+        // The gate evaluates the SHA the worker pushed. shipped_in[0] would be
+        // an older merge; the most recent SHA (this merge) is what the gate
+        // should reach for. Use [mergeSha, ...prior] so newest is first.
+        shipped_in: [mergeSha, ...prior],
+        target_repo: targetRepo,
+      },
+      gateDeps,
+    );
+
+    if (!gateRes.passed && gateRes.friction) {
+      heldByGate.push(cid);
+      // Best-effort friction persist; do not block the merge orchestration on
+      // a single failed insert.
+      await insertPhysicalGateFriction(sb as unknown as Parameters<typeof insertPhysicalGateFriction>[0], {
+        payload: gateRes.friction,
+        reported_by: audit.triggered_by_agent_id,
+        project,
+        severity: "blocker",
+      }).catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[conductor/merge] friction insert(${cid}): ${msg}`);
+      });
+      // Append SHA to shipped_in for record, but DO NOT flip status.
+      const { error: shaErr } = await sb
+        .from("bible_clauses")
+        .update({ shipped_in: next, updated_at: new Date().toISOString() })
+        .eq("id", cid);
+      if (shaErr) {
+        console.error(`[conductor/merge] update shipped_in(${cid}): ${shaErr.message}`);
+      }
+      continue;
+    }
+    // Gate passed → safe to flip to shipped.
     const { error: updErr } = await sb
       .from("bible_clauses")
       .update({ status: "shipped", shipped_in: next, updated_at: new Date().toISOString() })
       .eq("id", cid);
     if (updErr) {
       console.error(`[conductor/merge] update bible_clauses(${cid}): ${updErr.message}`);
+      continue;
     }
+    shipped.push(cid);
   }
 
-  // Fire one shipped event covering the merge. agent_events is the NOUS sink.
-  const { error: evtErr } = await sb.from("agent_events").insert({
-    event_type: "shipped",
-    agent_id: audit.triggered_by_agent_id,
-    agent_type: "conductor",
-    project,
-    summary: `merged ${clauseIds.length} clause(s) at ${mergeSha.slice(0, 7)}`,
-    details: { clause_ids: clauseIds, merge_sha: mergeSha, session_id: audit.session_id },
-    session_id: audit.session_id,
-  });
-  if (evtErr) {
-    console.error(`[conductor/merge] insert agent_events shipped: ${evtErr.message}`);
+  // Fire one shipped event covering the clauses that actually shipped.
+  // agent_events is the NOUS sink; held clauses are recorded separately.
+  if (shipped.length > 0) {
+    const { error: evtErr } = await sb.from("agent_events").insert({
+      event_type: "shipped",
+      agent_id: audit.triggered_by_agent_id,
+      agent_type: "conductor",
+      project,
+      summary: `merged ${shipped.length} clause(s) at ${mergeSha.slice(0, 7)}`,
+      details: {
+        clause_ids: shipped,
+        held_by_gate: heldByGate,
+        merge_sha: mergeSha,
+        session_id: audit.session_id,
+      },
+      session_id: audit.session_id,
+    });
+    if (evtErr) {
+      console.error(`[conductor/merge] insert agent_events shipped: ${evtErr.message}`);
+    }
+  }
+  if (heldByGate.length > 0) {
+    console.warn(
+      `[conductor/merge] held by physical_verification_gate: ${heldByGate.join(", ")}`,
+    );
   }
 }
 
