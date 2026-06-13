@@ -2,12 +2,18 @@
 // AGT.1.2 — Wave organization: feature_group + DAG + WSJF priority ranking
 // + sequence_order assignment.
 //
+// NOUS.IDLOCK.6 — ingestion → graph/read wave gate runs BEFORE DAG layering,
+// so injected requires[] entries shape in-degree computation in layerByDAG.
+// This guarantees ingestion clauses occupy an earlier wave than every
+// graph/read clause in the same feature.
+//
 // WSJF = cost_of_delay / expected_effort.  Critical-path clauses always
 // override WSJF (they ship first regardless of their score). All fields
 // here are schema-conformant with bible_clauses (feature_id, sequence_order,
 // requires, enables, critical_path).
 
 import type { ClauseSpec } from "./decomposition.js";
+import { injectIngestionGates } from "./ingestion_gate.js";
 
 export interface Wave {
   index: number;                 // 0-based wave number
@@ -114,12 +120,17 @@ export function organizeWaves(featureId: string, clauses: ClauseSpec[]): WaveOrg
     };
   }
 
-  const waves = layerByDAG(clauses);
+  // NOUS.IDLOCK.6 — wave gate. Ingestion-classed clauses become hard requires
+  // for every graph/read clause in the same feature. Runs BEFORE layerByDAG so
+  // injected requires[] shape in-degree.
+  const gated = injectIngestionGates(clauses);
+
+  const waves = layerByDAG(gated);
 
   // Stamp sequence_order (1-based, monotonic across waves) and
   // parallel_safe_with (sibling clause_ids in the same wave) onto each clause.
   // priority_rank is a per-feature 1-based rank across all clauses, WSJF-sorted.
-  const wsjfRanked = [...clauses].sort((a, b) => {
+  const wsjfRanked = [...gated].sort((a, b) => {
     if (a.critical_path !== b.critical_path) return a.critical_path ? -1 : 1;
     return wsjfScore(b) - wsjfScore(a);
   });
@@ -130,7 +141,7 @@ export function organizeWaves(featureId: string, clauses: ClauseSpec[]): WaveOrg
   let seq = 0;
   for (const wave of waves) {
     for (const cid of wave.clause_ids) {
-      const c = clauses.find((x) => x.id === cid);
+      const c = gated.find((x) => x.id === cid);
       if (!c) continue;
       seq += 1;
       stamped.push({
