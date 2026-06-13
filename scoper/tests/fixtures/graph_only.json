@@ -1,0 +1,53 @@
+{
+  "feature_group": "AXO.GRAPHONLY",
+  "clauses": [
+    {
+      "id": "AXO.GRAPHONLY.1",
+      "prefix": "AXO.GRAPHONLY",
+      "parent_id": null,
+      "title": "Pure graph endpoint A",
+      "feature_id": "axo-graphonly",
+      "sequence_order": 1,
+      "maturity_stage": "scaffold",
+      "status": "draft",
+      "clause_type": "graph",
+      "critical_path": false,
+      "requires": [],
+      "enables": [],
+      "acceptance_criteria": [],
+      "body": "Standalone graph endpoint, no ingestion sibling."
+    },
+    {
+      "id": "AXO.GRAPHONLY.2",
+      "prefix": "AXO.GRAPHONLY",
+      "parent_id": null,
+      "title": "Pure graph endpoint B",
+      "feature_id": "axo-graphonly",
+      "sequence_order": 2,
+      "maturity_stage": "scaffold",
+      "status": "draft",
+      "clause_type": "graph",
+      "critical_path": false,
+      "requires": [],
+      "enables": [],
+      "acceptance_criteria": [],
+      "body": "Second standalone graph endpoint."
+    },
+    {
+      "id": "AXO.GRAPHONLY.3",
+      "prefix": "AXO.GRAPHONLY",
+      "parent_id": null,
+      "title": "Read endpoint with no ingestion",
+      "feature_id": "axo-graphonly",
+      "sequence_order": 3,
+      "maturity_stage": "scaffold",
+      "status": "draft",
+      "clause_type": "read",
+      "critical_path": false,
+      "requires": [],
+      "enables": [],
+      "acceptance_criteria": [],
+      "body": "Read endpoint, no ingestion sibling."
+    }
+  ]
+}
