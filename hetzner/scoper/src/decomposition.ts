@@ -44,6 +44,11 @@ export interface ClauseSpec {
   contract?: ClauseContract;
   feature_group?: string;
   parallel_safe_with?: string[];
+  // AGT.SCOPER.SEAM_CLAUSE.1 — machine-readable mount point declaration.
+  // MANDATORY when clause_type === 'component' (enforced by validateClauseMountTargets).
+  // Value is a route path (e.g. "/shifts"), component display name (e.g. "ShiftsBoardChrome"),
+  // or CSS selector (e.g. "aside.shifts-board-chrome__sidebar").
+  mount_target?: string;
 }
 
 export interface AcceptanceCriterion {
