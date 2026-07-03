@@ -1,16 +1,17 @@
 {
   "name": "conductor-merge-gates",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "NOUS.CONDUCTOR.MERGE_GATES.1 — live staging-HEAD merge invariant. Fetches the origin/staging tip from the GitHub REST API immediately before every PATCH merge request; fetch failure = hard abort; 409 = merge_conflict logged, clause not advanced. NOUS.CONDUCTOR.MERGE_GATES.2 — post-merge two-phase build gate (tsc --noEmit then production bundle build) runs against the merged staging checkout; either phase non-zero = clause not advanced to shipped. NOUS.CONDUCTOR.MERGE_GATES.3 — pre-swap smoke gate serves the freshly built dist/ on a temporary local port, verifies index HTTP 200, and runs a headless mount check for console errors; only on smoke_passed does swapDist atomically replace the served dist/; on failure the existing dist/ is preserved and the clause is marked verification_pending with a decision_queue row.",
+  "description": "NOUS.CONDUCTOR.MERGE_GATES.1 — live staging-HEAD merge invariant. Fetches the origin/staging tip from the GitHub REST API immediately before every PATCH merge request; fetch failure = hard abort; 409 = merge_conflict logged, clause not advanced. NOUS.CONDUCTOR.MERGE_GATES.2 — post-merge two-phase build gate (tsc --noEmit then production bundle build) runs against the merged staging checkout; either phase non-zero = clause not advanced to shipped. NOUS.CONDUCTOR.MERGE_GATES.3 — pre-swap smoke gate serves the freshly built dist/ on a temporary local port, verifies index HTTP 200, and runs a headless mount check for console errors; only on smoke_passed does swapDist atomically replace the served dist/; on failure the existing dist/ is preserved and the clause is marked verification_pending with a decision_queue row. NOUS.CONDUCTOR.MERGE_GATES.4 — wave auto-continuation. checkWaveCompletion synchronously drives the wave state machine after every clause is flipped to shipped; fires the next wave via Scoper (retry cap 3, hard-stall on 30-minute wall-clock ceiling); emits wave_continuation_fired / pipeline_complete / stalled_wave_continuation onto pipeline_events without coupling to a notification channel.",
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts",
+    "test": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts",
     "test:merge_gates_1": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts",
     "test:merge_gates_2": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts",
-    "test:merge_gates_3": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts"
+    "test:merge_gates_3": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts",
+    "test:merge_gates_4": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
