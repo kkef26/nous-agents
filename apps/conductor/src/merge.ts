@@ -18,6 +18,11 @@
  */
 
 import type { MergeResult } from './types.js';
+import {
+  checkWaveCompletion,
+  type CheckWaveCompletionDeps,
+  type CheckWaveCompletionResult,
+} from './wave-continuation.js';
 
 const GITHUB_API = 'https://api.github.com';
 const STAGING_BRANCH = 'staging';
@@ -203,4 +208,58 @@ export async function mergeToStaging(
     }`,
     resp.status,
   );
+}
+
+// -----------------------------------------------------------------------------
+// NOUS.CONDUCTOR.MERGE_GATES.4 — clause → shipped flip triggers wave continuation
+//
+// Any code path that transitions a clause to `shipped` MUST route
+// through this helper so the wave state machine advances in the same
+// synchronous unit as the clause write (AC6). The order is fixed:
+//
+//   1. markClauseShipped(clauseId)   — persist the clause status
+//   2. checkWaveCompletion(...)      — evaluate the wave, maybe fire
+//
+// The wave-check runs synchronously — the caller awaits it before
+// returning from flipClauseToShipped (constraint of AC6). All wave and
+// clause writes flow through the shared state clients passed in via
+// FlipClauseToShippedDeps (constraint #1 of MERGE_GATES.4).
+
+export interface ClauseStateClient {
+  /** Flip a single clause to the terminal 'shipped' status. */
+  markClauseShipped(clauseId: string): Promise<void>;
+}
+
+export interface FlipClauseToShippedArgs {
+  clauseId: string;
+  featureId: string;
+  waveIndex: number;
+}
+
+export interface FlipClauseToShippedDeps {
+  clauseStateClient: ClauseStateClient;
+  waveContinuationDeps: CheckWaveCompletionDeps;
+}
+
+export interface FlipClauseToShippedResult {
+  clauseStatus: 'shipped';
+  waveCheck: CheckWaveCompletionResult;
+}
+
+/**
+ * Advance a clause to `shipped` and synchronously drive the wave
+ * state machine. The wave-check result is returned so callers can
+ * log the outcome (continuation_fired / pipeline_complete / stalled)
+ * without a second store round-trip.
+ */
+export async function flipClauseToShipped(
+  args: FlipClauseToShippedArgs,
+  deps: FlipClauseToShippedDeps,
+): Promise<FlipClauseToShippedResult> {
+  await deps.clauseStateClient.markClauseShipped(args.clauseId);
+  const waveCheck = await checkWaveCompletion(
+    { featureId: args.featureId, waveIndex: args.waveIndex },
+    deps.waveContinuationDeps,
+  );
+  return { clauseStatus: 'shipped', waveCheck };
 }

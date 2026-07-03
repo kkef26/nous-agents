@@ -151,3 +151,41 @@ export interface SmokeGateFailed {
 }
 
 export type SmokeGateResult = SmokeGatePassed | SmokeGateFailed;
+
+// -----------------------------------------------------------------------------
+// NOUS.CONDUCTOR.MERGE_GATES.4 — wave auto-continuation types
+//
+// A wave transitions through this small state machine:
+//   in_progress → shipped → { continuation_fired | complete | stalled }
+//
+// The literal 'continuation_fired' is the mandatory guard added by
+// AC7; any switch over WaveStatus that omits it triggers a
+// `never` type error at tsc --noEmit time, and the AC7 test covers
+// the exhaustive branch.
+
+export type WaveStatus =
+  | 'in_progress'
+  | 'shipped'
+  | 'continuation_fired'
+  | 'complete'
+  | 'stalled';
+
+export type WaveClauseStatus = 'pending' | 'in_progress' | 'shipped' | 'failed';
+
+export interface WaveClauseSnapshot {
+  clause_id: string;
+  status: WaveClauseStatus;
+}
+
+export interface WaveSnapshot {
+  feature_id: string;
+  wave_index: number;
+  status: WaveStatus;
+  clauses: WaveClauseSnapshot[];
+  /**
+   * ISO timestamp recorded when the wave FIRST transitions to fully
+   * shipped (all clauses shipped). Undefined until that transition;
+   * constraint #2 forbids starting the stall timer any earlier.
+   */
+  shipped_at?: string;
+}
