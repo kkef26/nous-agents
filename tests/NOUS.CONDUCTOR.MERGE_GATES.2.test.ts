@@ -341,6 +341,13 @@ describe('C2 conductor wiring — build gate placement + shipped guard', () => {
       headSha: '33334444',
       githubToken: 'ghp_faketoken',
       workingDir: WD,
+      // NOUS.CONDUCTOR.MERGE_GATES.3 extended ConductorRunArgs with the
+      // dist paths for the smoke gate. These tests never reach the smoke
+      // gate (they exercise the merge → build-gate seam), so placeholder
+      // values are sufficient — but the fields are required by the
+      // TypeScript type and must be populated.
+      newDistPath: `${WD}/dist`,
+      servedDistPath: '/var/www/served/dist',
       ...over,
     };
   }
@@ -363,6 +370,10 @@ describe('C2 conductor wiring — build gate placement + shipped guard', () => {
     const result = await runConductor(baseConductorArgs(), {
       mergeImpl,
       buildGateImpl,
+      // NOUS.CONDUCTOR.MERGE_GATES.3 wired a smoke gate downstream of
+      // the build gate. This test asserts the merge → buildGate order,
+      // so the smoke phase is stubbed to smoke_passed here.
+      smokeGateImpl: async () => ({ status: 'smoke_passed' }),
     });
     assert.deepEqual(order, ['merge', 'buildGate']);
     assert.equal(result.status, 'shipped');
@@ -466,6 +477,10 @@ describe('C2 conductor wiring — build gate placement + shipped guard', () => {
     const result = await runConductor(baseConductorArgs(), {
       mergeImpl: async () => MERGED,
       buildGateImpl: async () => passing,
+      // NOUS.CONDUCTOR.MERGE_GATES.3 wired a smoke gate downstream of
+      // the build gate. This test asserts merge + buildGate propagate
+      // into the shipped verdict, so the smoke phase is stubbed here.
+      smokeGateImpl: async () => ({ status: 'smoke_passed' }),
     });
     assert.equal(result.status, 'shipped');
     if (result.status === 'shipped') {

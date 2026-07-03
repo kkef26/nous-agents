@@ -118,3 +118,36 @@ export type BuildGateResult =
   | BuildGateTscFailed
   | BuildGateBuildFailed
   | BuildGateSetupFailed;
+
+// -----------------------------------------------------------------------------
+// NOUS.CONDUCTOR.MERGE_GATES.3 — pre-swap smoke gate
+//
+// The 2026-07-03 whole-tree-break decision:
+//   "Deploy smoke gate: before overwriting a served dist/, conductor
+//    verifies the fresh build serves (HTTP 200 on index) and the entry
+//    route mounts without console errors. On failure: keep previous
+//    dist, mark clause verification_pending, surface to decision_queue."
+//
+// The SmokeGateResult union covers exactly two terminal statuses.
+// smoke_failed ALWAYS carries a non-optional discriminated reason so
+// that `tsc --noEmit` rejects any case branch that omits it (constraint
+// #8). Adding a new failure mode requires extending SmokeFailReason,
+// which propagates as a compile error to every consumer.
+
+/** Every distinct reason a smoke gate can refuse to pass. */
+export type SmokeFailReason =
+  | 'http_check_failed'
+  | 'headless_mount_error'
+  | 'headless_timeout';
+
+export interface SmokeGatePassed {
+  status: 'smoke_passed';
+}
+
+export interface SmokeGateFailed {
+  status: 'smoke_failed';
+  /** Non-optional — TS rejects any smoke_failed branch that omits it. */
+  reason: SmokeFailReason;
+}
+
+export type SmokeGateResult = SmokeGatePassed | SmokeGateFailed;

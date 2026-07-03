@@ -30,6 +30,7 @@ export interface BuildGateConfig {
 
 export interface ConductorConfig {
   buildGate: BuildGateConfig;
+  smokeGate: SmokeGateConfig;
 }
 
 export const DEFAULT_BUILD_GATE_CONFIG: BuildGateConfig = {
@@ -37,6 +38,74 @@ export const DEFAULT_BUILD_GATE_CONFIG: BuildGateConfig = {
   buildCommand: { bin: 'vite', args: ['build'] },
 };
 
+// -----------------------------------------------------------------------------
+// NOUS.CONDUCTOR.MERGE_GATES.3 — smoke-gate configuration.
+//
+// Three tunables carried into runSmokeGate:
+//   entryRoute       — path appended to http://127.0.0.1:${servePort}
+//                      when the headless check mounts the built app
+//   servePort        — port the temporary local serve process binds to
+//   headlessTimeoutMs — hard cap on the headless mount check; on expiry
+//                      the check aborts and runSmokeGate resolves with
+//                      SmokeGateResult { reason: 'headless_timeout' }
+//
+// Each field is independently overridable via a dedicated environment
+// variable (constraint AC7). Callers that want the exact literal
+// defaults with no env consultation should read DEFAULT_SMOKE_GATE_
+// CONFIG; callers that want env-derived config should call
+// loadSmokeGateConfig(env).
+
+export interface SmokeGateConfig {
+  entryRoute: string;
+  servePort: number;
+  headlessTimeoutMs: number;
+}
+
+export const SMOKE_GATE_ENV_KEYS = {
+  entryRoute: 'NOUS_CONDUCTOR_SMOKE_ENTRY_ROUTE',
+  servePort: 'NOUS_CONDUCTOR_SMOKE_SERVE_PORT',
+  headlessTimeoutMs: 'NOUS_CONDUCTOR_SMOKE_HEADLESS_TIMEOUT_MS',
+} as const;
+
+export const DEFAULT_SMOKE_GATE_CONFIG: SmokeGateConfig = {
+  entryRoute: '/',
+  servePort: 4099,
+  headlessTimeoutMs: 15000,
+};
+
+/**
+ * Build a SmokeGateConfig by layering environment overrides over
+ * DEFAULT_SMOKE_GATE_CONFIG. Numeric fields fall back to the default
+ * whenever the raw env value fails Number.isFinite (rather than
+ * silently producing NaN) — the smoke gate never runs against a
+ * malformed port or timeout.
+ */
+export function loadSmokeGateConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): SmokeGateConfig {
+  const rawPort = env[SMOKE_GATE_ENV_KEYS.servePort];
+  const rawTimeout = env[SMOKE_GATE_ENV_KEYS.headlessTimeoutMs];
+  const rawRoute = env[SMOKE_GATE_ENV_KEYS.entryRoute];
+
+  const port = rawPort !== undefined && rawPort !== '' ? Number(rawPort) : NaN;
+  const timeout =
+    rawTimeout !== undefined && rawTimeout !== '' ? Number(rawTimeout) : NaN;
+
+  return {
+    entryRoute:
+      rawRoute !== undefined && rawRoute !== ''
+        ? rawRoute
+        : DEFAULT_SMOKE_GATE_CONFIG.entryRoute,
+    servePort: Number.isFinite(port)
+      ? port
+      : DEFAULT_SMOKE_GATE_CONFIG.servePort,
+    headlessTimeoutMs: Number.isFinite(timeout)
+      ? timeout
+      : DEFAULT_SMOKE_GATE_CONFIG.headlessTimeoutMs,
+  };
+}
+
 export const defaultConductorConfig: ConductorConfig = {
   buildGate: DEFAULT_BUILD_GATE_CONFIG,
+  smokeGate: DEFAULT_SMOKE_GATE_CONFIG,
 };
