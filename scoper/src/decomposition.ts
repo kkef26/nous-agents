@@ -23,6 +23,7 @@ import yaml from "js-yaml";
 import type { FeatureSourceMaterial, SourceMaterialRow } from "./lib/common/source_material.js";
 import { MOLD_SIZE, emitPipelineEvent } from "./_shared.js";
 import { allocateClauseIds, AllocatorUnavailableError } from "./allocator.js";
+import { injectSeamClause } from "./seam.js";
 
 // ─── Public interfaces (unchanged — plan.ts depends on these) ───────────────
 
@@ -1237,9 +1238,15 @@ export async function decomposeFeature(
   clauseIds: string[],
   opts?: { architectureDoc?: string | null; projectTag?: string; sessionId?: string },
 ): Promise<DecompositionOutput> {
+  let output: DecompositionOutput;
   if (clauseIds.length === 0 && opts?.projectTag) {
     console.log(`[scoper] generate mode (injection mold): ${featureId} has no clauses, generating from source material`);
-    return await generateClausesFromSource(featureId, featureName, description, opts.projectTag);
+    output = await generateClausesFromSource(featureId, featureName, description, opts.projectTag);
+  } else {
+    output = await enrichExistingClauses(featureId, featureName, description, clauseIds, opts);
   }
-  return await enrichExistingClauses(featureId, featureName, description, clauseIds, opts);
+  // AGT.SCOPER.SEAM_CLAUSE.2: append a seam clause as the final wave whenever
+  // one or more component clauses are present. Idempotent: no-op when no
+  // component clauses exist or a seam is already in the plan.
+  return { ...output, clauses: injectSeamClause(output.clauses) };
 }
