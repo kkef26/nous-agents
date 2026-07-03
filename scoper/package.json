@@ -9,10 +9,12 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.1.mount_target_schema.test.ts ../tests/AGT.SCOPER.SEAM_CLAUSE.1.prereq_rejection.test.ts ../tests/AGT.SCOPER.SEAM_CLAUSE.1.db_migration.test.ts",
+    "test": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.1.mount_target_schema.test.ts ../tests/AGT.SCOPER.SEAM_CLAUSE.1.prereq_rejection.test.ts ../tests/AGT.SCOPER.SEAM_CLAUSE.1.db_migration.test.ts ../tests/AGT.SCOPER.SEAM_CLAUSE.3.deployed_pixel_schema.test.ts ../tests/AGT.SCOPER.SEAM_CLAUSE.3.seam_ac_enforcement.test.ts",
     "test:seam_clause_1_schema": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.1.mount_target_schema.test.ts",
     "test:seam_clause_1_prereq": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.1.prereq_rejection.test.ts",
-    "test:seam_clause_1_migration": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.1.db_migration.test.ts"
+    "test:seam_clause_1_migration": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.1.db_migration.test.ts",
+    "test:seam_clause_3_schema": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.3.deployed_pixel_schema.test.ts",
+    "test:seam_clause_3_enforcement": "node --test --import tsx ../tests/AGT.SCOPER.SEAM_CLAUSE.3.seam_ac_enforcement.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",

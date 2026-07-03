@@ -23,6 +23,7 @@ import yaml from "js-yaml";
 import type { FeatureSourceMaterial, SourceMaterialRow } from "./lib/common/source_material.js";
 import { MOLD_SIZE, emitPipelineEvent } from "./_shared.js";
 import { allocateClauseIds, AllocatorUnavailableError } from "./allocator.js";
+import { validateSeamClauseACs } from "./seam_ac_gate.js";
 
 // ─── Public interfaces (unchanged — plan.ts depends on these) ───────────────
 
@@ -51,11 +52,76 @@ export interface ClauseSpec {
   mount_target?: string;
 }
 
+// AGT.SCOPER.SEAM_CLAUSE.3 — verification type union promoted to a named
+// alias so downstream code (evaluator dispatch map, seam AC gate) can
+// pattern-match on it without duplicating the literal list. Adding a new
+// verification type here propagates as a TS error to every consumer.
+export type VerificationType = "auto" | "physical_qa" | "kosta_review" | "deployed-pixel";
+
+// AGT.SCOPER.SEAM_CLAUSE.3 — literal for cross-module reference. Downstream
+// evaluators and the seam AC gate import this instead of hardcoding the
+// string.
+export const DEPLOYED_PIXEL_VERIFICATION = "deployed-pixel" as const;
+
+// AGT.SCOPER.SEAM_CLAUSE.3 — test_contract shape for a deployed-pixel AC.
+// The Conductor evaluator fetches `deployed_url`, parses the DOM, and asserts
+// that `selector` resolves to at least one element. Both fields are REQUIRED
+// on a deployed-pixel AC; validateDeployedPixelACSchema throws when either
+// is missing / empty / non-string.
+export interface DeployedPixelTestContract {
+  deployed_url: string;
+  selector: string;
+}
+
 export interface AcceptanceCriterion {
   id: string;
   text: string;
-  verification: "auto" | "physical_qa" | "kosta_review";
+  verification: VerificationType;
   form: "ulwick" | "technical_spec";
+  // AGT.SCOPER.SEAM_CLAUSE.3 — REQUIRED when verification === 'deployed-pixel',
+  // OPTIONAL otherwise. Runtime enforcement lives in
+  // validateDeployedPixelACSchema; the field is typed as optional at the
+  // interface level so non-deployed-pixel ACs never need to carry it.
+  test_contract?: DeployedPixelTestContract;
+}
+
+/**
+ * AGT.SCOPER.SEAM_CLAUSE.3 — runtime schema validation for a deployed-pixel AC.
+ *
+ * Non-deployed-pixel ACs are IGNORED (return early). For a deployed-pixel AC,
+ * throws Error with a specific message when:
+ *   - test_contract is missing entirely
+ *   - test_contract.deployed_url is missing / non-string / empty / whitespace
+ *   - test_contract.selector is missing / non-string / empty / whitespace
+ *
+ * The codebase does not use Zod. This function is the equivalent of a Zod
+ * refinement — it runs at construction / validation time and enforces the
+ * cross-field invariant that a 'deployed-pixel' verification type demands a
+ * well-formed test_contract payload.
+ *
+ * Exported for unit testing and for callers that assemble ACs
+ * programmatically (see validateClause in decomposition.ts).
+ */
+export function validateDeployedPixelACSchema(ac: AcceptanceCriterion): void {
+  if (ac.verification !== DEPLOYED_PIXEL_VERIFICATION) return;
+  const tc = ac.test_contract;
+  if (!tc || typeof tc !== "object") {
+    throw new Error(
+      `AC ${ac.id}: verification='deployed-pixel' requires a test_contract object with deployed_url and selector`,
+    );
+  }
+  const url = tc.deployed_url;
+  if (typeof url !== "string" || url.trim().length === 0) {
+    throw new Error(
+      `AC ${ac.id}: test_contract.deployed_url must be a non-empty string on a deployed-pixel AC`,
+    );
+  }
+  const sel = tc.selector;
+  if (typeof sel !== "string" || sel.trim().length === 0) {
+    throw new Error(
+      `AC ${ac.id}: test_contract.selector must be a non-empty string on a deployed-pixel AC`,
+    );
+  }
 }
 
 export interface ClauseContract {
@@ -339,11 +405,21 @@ function derivePreconditions(clauseRows: BibleClauseRow[]): string[] {
 // ─── LLM call helpers ───────────────────────────────────────────────────────
 
 function getProxyConfig() {
+  const directKey = process.env.ANTHROPIC_API_KEY;
+  if (directKey) {
+    return { url: "https://api.anthropic.com", key: directKey, direct: true };
+  }
   return {
     url: process.env.STATION_PROXY_URL ?? "http://127.0.0.1:8095",
     key: process.env.STATION_PROXY_KEY ?? process.env.NOUS_API_KEY ?? "",
+    direct: false,
   };
 }
+
+const MODEL_MAP: Record<string, string> = {
+  opus: "claude-opus-4-5",
+  sonnet: "claude-sonnet-4-5",
+};
 
 async function callLLM(opts: {
   system: string;
@@ -356,13 +432,20 @@ async function callLLM(opts: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), opts.timeout_ms);
 
+  const resolvedModel = proxy.direct ? (MODEL_MAP[opts.model] ?? opts.model) : opts.model;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-api-key": proxy.key,
+  };
+  if (proxy.direct) headers["anthropic-version"] = "2023-06-01";
+
   let response: Response;
   try {
     response = await fetch(`${proxy.url}/v1/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": proxy.key },
+      headers,
       body: JSON.stringify({
-        model: opts.model,
+        model: resolvedModel,
         max_tokens: opts.max_tokens,
         system: opts.system,
         messages: [{ role: "user", content: opts.userMessage }],
@@ -375,7 +458,7 @@ async function callLLM(opts: {
 
   const raw = await response.text();
   if (!response.ok) {
-    throw new Error(`station-proxy ${response.status}: ${raw.slice(0, 400)}`);
+    throw new Error(`LLM ${response.status}: ${raw.slice(0, 400)}`);
   }
 
   let apiResponse: {
@@ -385,10 +468,10 @@ async function callLLM(opts: {
   try {
     apiResponse = JSON.parse(raw);
   } catch (err) {
-    throw new Error(`station-proxy non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
+    throw new Error(`LLM non-JSON: ${(err as Error).message}: ${raw.slice(0, 200)}`);
   }
 
-  const textBlock = apiResponse.content?.find((c) => c.type === "text");
+  const textBlock = apiResponse.content?.find((c: { type: string }) => c.type === "text");
   return {
     text: stripJsonFences(textBlock?.text ?? ""),
     tokens_in: apiResponse.usage?.input_tokens ?? 0,
@@ -750,14 +833,23 @@ function validateClause(gc: GenerateLLMOutput["clauses"][0], prefix: string): Cl
   if (!gc.id || !gc.body) return null;
   const validACs: AcceptanceCriterion[] = (gc.acceptance_criteria ?? [])
     .filter((ac) => ac.text && ac.verification && ac.form)
-    .map((ac, i) => ({
-      id: ac.id || `AC${String(i + 1).padStart(2, "0")}`,
-      text: ac.text,
-      verification: (["auto", "physical_qa", "kosta_review"].includes(ac.verification)
-        ? ac.verification : "auto") as "auto" | "physical_qa" | "kosta_review",
-      form: (ac.form === "ulwick" || ac.form === "technical_spec"
-        ? ac.form : "technical_spec") as "ulwick" | "technical_spec",
-    }));
+    .map((ac, i) => {
+      const rawAc = ac as unknown as { verification: string; test_contract?: DeployedPixelTestContract };
+      const verification: VerificationType = ["auto", "physical_qa", "kosta_review", "deployed-pixel"].includes(rawAc.verification)
+        ? (rawAc.verification as VerificationType)
+        : "auto";
+      const result: AcceptanceCriterion = {
+        id: ac.id || `AC${String(i + 1).padStart(2, "0")}`,
+        text: ac.text,
+        verification,
+        form: (ac.form === "ulwick" || ac.form === "technical_spec"
+          ? ac.form : "technical_spec") as "ulwick" | "technical_spec",
+      };
+      if (verification === DEPLOYED_PIXEL_VERIFICATION && rawAc.test_contract) {
+        result.test_contract = rawAc.test_contract;
+      }
+      return result;
+    });
 
   // Ensure minimum 2 ACs
   while (validACs.length < 2) {
@@ -897,6 +989,7 @@ async function generateClausesFromSource(
     const stub = skeleton.stubs[i];
     const slot = allocation.slots[i];
     if (!slot) {
+      // Allocator returned fewer slots than requested — surface as fatal.
       throw new AllocatorUnavailableError(
         `requested ${skeleton.stubs.length} IDs, got ${allocation.slots.length}`,
       );
@@ -918,6 +1011,9 @@ async function generateClausesFromSource(
     });
   }
 
+  // Rewrite every stub id + dependency reference to use allocated IDs.
+  // Internal references that target a skipped (placeholder) stub are dropped
+  // from requires/enables — the dependency never made it into the dispatch tree.
   const remappedStubs: ClauseStub[] = usableStubs.map((s) => ({
     ...s,
     id: idMap.get(s.id)!,
@@ -1080,7 +1176,7 @@ async function enrichWithLLM(
       userMessage,
       model: "sonnet",
       max_tokens: 8192,
-      timeout_ms: 130_000,
+      timeout_ms: 300_000,
     });
 
     const cost_usd = (tokens_in * 3 + tokens_out * 15) / 1_000_000;
@@ -1099,12 +1195,22 @@ async function enrichWithLLM(
       if (!ec.id || !Array.isArray(ec.acceptance_criteria) || !ec.contract) continue;
       const validACs = ec.acceptance_criteria
         .filter((ac) => ac.text && ac.verification && ac.form)
-        .map((ac, i) => ({
-          id: ac.id || `AC${String(i + 1).padStart(2, "0")}`,
-          text: ac.text,
-          verification: (["auto", "physical_qa", "kosta_review"].includes(ac.verification) ? ac.verification : "auto") as "auto" | "physical_qa" | "kosta_review",
-          form: (ac.form === "ulwick" || ac.form === "technical_spec" ? ac.form : "technical_spec") as "ulwick" | "technical_spec",
-        }));
+        .map((ac, i) => {
+          const rawAc = ac as unknown as { verification: string; test_contract?: DeployedPixelTestContract };
+          const verification: VerificationType = ["auto", "physical_qa", "kosta_review", "deployed-pixel"].includes(rawAc.verification)
+            ? (rawAc.verification as VerificationType)
+            : "auto";
+          const result: AcceptanceCriterion = {
+            id: ac.id || `AC${String(i + 1).padStart(2, "0")}`,
+            text: ac.text,
+            verification,
+            form: (ac.form === "ulwick" || ac.form === "technical_spec" ? ac.form : "technical_spec") as "ulwick" | "technical_spec",
+          };
+          if (verification === DEPLOYED_PIXEL_VERIFICATION && rawAc.test_contract) {
+            result.test_contract = rawAc.test_contract;
+          }
+          return result;
+        });
       const contract: ClauseContract = {
         elements: Array.isArray(ec.contract.elements) ? ec.contract.elements : [],
         exclusions: Array.isArray(ec.contract.exclusions) ? ec.contract.exclusions : [],
@@ -1216,9 +1322,15 @@ export async function decomposeFeature(
   clauseIds: string[],
   opts?: { architectureDoc?: string | null; projectTag?: string; sessionId?: string },
 ): Promise<DecompositionOutput> {
-  if (clauseIds.length === 0 && opts?.projectTag) {
-    console.log(`[scoper] generate mode (injection mold): ${featureId} has no clauses, generating from source material`);
-    return await generateClausesFromSource(featureId, featureName, description, opts.projectTag);
-  }
-  return await enrichExistingClauses(featureId, featureName, description, clauseIds, opts);
+  const result = clauseIds.length === 0 && opts?.projectTag
+    ? await generateClausesFromSource(featureId, featureName, description, opts.projectTag)
+    : await enrichExistingClauses(featureId, featureName, description, clauseIds, opts);
+
+  // AGT.SCOPER.SEAM_CLAUSE.3 — post-synthesis seam AC gate. Runs against the
+  // fully assembled clause set right before the dispatch tree is returned.
+  // Throws SeamACViolationError before the caller ever sees the plan when a
+  // seam clause carries a UI AC with verification !== 'deployed-pixel'.
+  validateSeamClauseACs(result.clauses);
+
+  return result;
 }

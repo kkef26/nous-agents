@@ -17,10 +17,14 @@
   },
   "include": [
     "src/**/*.ts",
+    "../../scoper/src/decomposition.ts",
+    "../../scoper/src/errors.ts",
+    "../../scoper/src/seam_ac_gate.ts",
     "../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts",
     "../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts",
     "../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts",
-    "../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts"
+    "../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts",
+    "../../tests/AGT.SCOPER.SEAM_CLAUSE.3.conductor_evaluator.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

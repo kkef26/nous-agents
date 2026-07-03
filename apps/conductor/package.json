@@ -7,11 +7,12 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts",
+    "test": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts ../../tests/AGT.SCOPER.SEAM_CLAUSE.3.conductor_evaluator.test.ts",
     "test:merge_gates_1": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts",
     "test:merge_gates_2": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts",
     "test:merge_gates_3": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.3.test.ts",
-    "test:merge_gates_4": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts"
+    "test:merge_gates_4": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.4.test.ts",
+    "test:seam_clause_3_evaluator": "node --test --import tsx ../../tests/AGT.SCOPER.SEAM_CLAUSE.3.conductor_evaluator.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
