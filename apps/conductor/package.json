@@ -1,13 +1,15 @@
 {
   "name": "conductor-merge-gates",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "NOUS.CONDUCTOR.MERGE_GATES.1 — live staging-HEAD merge invariant. Fetches the origin/staging tip from the GitHub REST API immediately before every PATCH merge request; fetch failure = hard abort; 409 = merge_conflict logged, clause not advanced.",
+  "description": "NOUS.CONDUCTOR.MERGE_GATES.1 — live staging-HEAD merge invariant. Fetches the origin/staging tip from the GitHub REST API immediately before every PATCH merge request; fetch failure = hard abort; 409 = merge_conflict logged, clause not advanced. NOUS.CONDUCTOR.MERGE_GATES.2 — post-merge two-phase build gate (tsc --noEmit then production bundle build) runs against the merged staging checkout; either phase non-zero = clause not advanced to shipped.",
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts"
+    "test": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts",
+    "test:merge_gates_1": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.1.test.ts",
+    "test:merge_gates_2": "node --test --import tsx ../../tests/NOUS.CONDUCTOR.MERGE_GATES.2.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

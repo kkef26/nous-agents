@@ -6,6 +6,12 @@
  *
  * A shipped verdict may only be written for status === 'merged'
  * (constraint #4).
+ *
+ * NOUS.CONDUCTOR.MERGE_GATES.2 — post-merge two-phase build gate
+ * (tsc --noEmit followed by production bundle build). The gate runs
+ * only after status === 'merged', against the post-merge staging
+ * checkout, and a non-passed BuildGateResult must NEVER be advanced
+ * to a shipped verdict.
  */
 
 export type MergeStatus =
@@ -44,3 +50,71 @@ export type MergeResult =
   | MergeConflict
   | MergeFetchFailed
   | MergeAborted;
+
+// -----------------------------------------------------------------------------
+// NOUS.CONDUCTOR.MERGE_GATES.2 — build gate
+
+/**
+ * Every completed spawn (whether it exited 0 or non-zero) surfaces as
+ * a CommandOutput so callers observe the raw stdout+stderr and the
+ * exit code exactly as reported. Constraint #3 forbids discarding
+ * stdout or stderr from a failing command — both fields are always
+ * populated on the failing branch of a BuildGateResult.
+ */
+export interface CommandOutput {
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+}
+
+export type BuildGateStatus =
+  | 'passed'
+  | 'tsc_failed'
+  | 'build_failed'
+  | 'setup_failed';
+
+export interface BuildGatePassed {
+  status: 'passed';
+  tsc: CommandOutput;
+  build: CommandOutput;
+}
+
+/**
+ * tsc --noEmit exited non-zero. The build phase MUST NOT have run.
+ * build_output carries the failing tsc invocation's exit_code, stdout,
+ * and stderr — persisted verbatim into conductor_log by the caller.
+ */
+export interface BuildGateTscFailed {
+  status: 'tsc_failed';
+  build_output: CommandOutput;
+}
+
+/**
+ * tsc --noEmit passed but the production bundle build exited non-zero.
+ * tsc_output retains the passing tsc invocation for downstream context;
+ * build_output carries the failing build invocation's exit_code,
+ * stdout, and stderr.
+ */
+export interface BuildGateBuildFailed {
+  status: 'build_failed';
+  tsc_output: CommandOutput;
+  build_output: CommandOutput;
+}
+
+/**
+ * A precondition of the build gate (working-directory presence, binary
+ * resolution from node_modules/.bin) failed before any command ran.
+ * The gate reports setup_failed rather than pretending the build
+ * succeeded, and the conductor treats setup_failed identically to a
+ * failed build phase — never yields a shipped verdict.
+ */
+export interface BuildGateSetupFailed {
+  status: 'setup_failed';
+  reason: string;
+}
+
+export type BuildGateResult =
+  | BuildGatePassed
+  | BuildGateTscFailed
+  | BuildGateBuildFailed
+  | BuildGateSetupFailed;
