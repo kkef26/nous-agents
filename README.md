@@ -2,6 +2,8 @@
 
 Two Supabase edge functions, one repo: **Conductor** (post-dispatch executor + merge gate) and **Scoper** (SCAFFOLD-stage planner). Part of the NOUS product family alongside `nous-station`, `nous-edge`, `nous-spawner`.
 
+> **Spawner**: The worker pool / dispatch agent lives in [`kkef26/nous-spawner`](https://github.com/kkef26/nous-spawner), not in this repo.
+
 ## Identity
 
 - Repo: `kkef26/nous-agents` (private)
